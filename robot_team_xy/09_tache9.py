@@ -6,7 +6,7 @@ import select
 from board import SCL, SDA
 import busio
 from adafruit_pca9685 import PCA9685
-from adafruit_motor import motor
+from adafruit_motor import motor, servo
 from gpiozero import DistanceSensor, LED
 from spi_ws2812 import Adeept_SPI_LedPixel
 
@@ -16,13 +16,14 @@ M1_IN2 = 14
 M2_IN1 = 12
 M2_IN2 = 13
 
-pwm    = None
-motor1 = None
-motor2 = None
+pwm       = None
+motor1    = None
+motor2    = None
+servo_dir = None
 
 
 def setup():
-    global pwm, motor1, motor2
+    global pwm, motor1, motor2, servo_dir
     i2c = busio.I2C(SCL, SDA)
     pwm = PCA9685(i2c, address=0x5f)
     pwm.frequency = 50
@@ -30,6 +31,8 @@ def setup():
     motor1.decay_mode = motor.SLOW_DECAY
     motor2 = motor.DCMotor(pwm.channels[M2_IN1], pwm.channels[M2_IN2])
     motor2.decay_mode = motor.SLOW_DECAY
+    servo_dir = servo.Servo(pwm.channels[0], min_pulse=500, max_pulse=2400, actuation_range=180)
+    servo_dir.angle = CENTER_ANGLE
 
 
 def stop():
@@ -50,8 +53,12 @@ def drive_ramp(speed_pct, direction, ramp_time=1.0):
     steps = 50
     delay = ramp_time / steps
     for i in range(1, steps + 1):
+        if checkdist() < OBSTACLE_DIST:
+            stop()
+            return False
         drive(speed_pct * i / steps, direction)
         time.sleep(delay)
+    return True
 
 
 def destroy_motor():
@@ -60,7 +67,7 @@ def destroy_motor():
 
 
 # --- Capteur ultrason ---
-sensor = DistanceSensor(echo=24, trigger=23, max_distance=2)
+sensor = DistanceSensor(echo=24, trigger=23, max_distance=2, queue_len=1)
 
 # --- LEDs WS2812 ---
 leds = Adeept_SPI_LedPixel(8, 60)
@@ -73,6 +80,7 @@ phare_d = LED(25)
 CENTER_ANGLE  = 97.5
 SPEED         = 40   # % vitesse (reduite pour les tests)
 OBSTACLE_DIST = 20   # cm
+WARNING_DIST  = 40   # cm - seuil d'alerte avant arret
 RAMP_TIME     = 0.5  # secondes
 
 # --- Etats ---
@@ -80,13 +88,17 @@ STOPPED  = 0
 RUNNING  = 1
 OBSTACLE = 2
 
-state       = STOPPED
-_blink      = False
-_last_blink = 0.0
+state         = STOPPED
+_blink        = False
+_last_blink   = 0.0
+_warned       = False
 
 
 def checkdist():
-    return sensor.distance * 100
+    d = sensor.distance
+    if d is None:
+        return 999
+    return d * 100
 
 
 def _set_hazard(on):
@@ -110,11 +122,14 @@ def update_blink():
 
 
 def start_move():
-    global state
+    global state, _warned
+    _warned = False
     _set_hazard(False)
-    drive_ramp(SPEED, 1, ramp_time=RAMP_TIME)
     state = RUNNING
-    print("-> Marche avant %d%%" % SPEED)
+    if not drive_ramp(SPEED, 1, ramp_time=RAMP_TIME):
+        obstacle_stop()
+    else:
+        print("-> Marche avant %d%%" % SPEED)
 
 
 def stop_robot(reason="manuel"):
@@ -129,6 +144,18 @@ def obstacle_stop():
     stop()
     state = OBSTACLE
     _last_blink = 0.0
+    time.sleep(0.15)
+    stable = 0
+    prev = checkdist()
+    while stable < 3:
+        time.sleep(0.05)
+        curr = checkdist()
+        if abs(curr - prev) < 0.08:
+            stable += 1
+        else:
+            stable = 0
+        prev = curr
+    print("-> ARRET  : distance finale %.1f cm" % curr)
     print("-> OBSTACLE detecte ! Feux de detresse actives")
 
 
@@ -170,12 +197,18 @@ if __name__ == "__main__":
             if state == RUNNING:
                 dist = checkdist()
                 if dist < OBSTACLE_DIST:
+                    print("-> STOP  : obstacle a %.1f cm" % dist)
                     obstacle_stop()
+                elif dist < WARNING_DIST and not _warned:
+                    _warned = True
+                    print("-> ALERTE: obstacle a %.1f cm" % dist)
+                elif dist >= WARNING_DIST:
+                    _warned = False
 
             elif state == OBSTACLE:
                 update_blink()
 
-            time.sleep(0.05)
+            time.sleep(0.02)
 
     except KeyboardInterrupt:
         print("\nFin de programme par Ctrl-C")
