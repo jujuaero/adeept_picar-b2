@@ -1,14 +1,8 @@
 from spi_ws2812 import Adeept_SPI_LedPixel
 
-# 14 LED WS2812 : 2 integrees au HAT + 4 modules de 3 LED
 led = Adeept_SPI_LedPixel(14, 50, 'GRB')
 
 def set_led(numero_led, couleur, intensite=255):
-    """
-    numero_led : de 0 a 13
-    couleur : 'R', 'G', 'B' ou 'N'
-    intensite : de 0 a 255
-    """
 
     if numero_led < 0 or numero_led > 13:
         print("Erreur : numero LED invalide")
@@ -34,7 +28,7 @@ def set_led(numero_led, couleur, intensite=255):
 
 def protocole_manuel():
     print("Commande : numero_led couleur intensite")
-    print("Exemple : 3 R 255")
+    print("Exemple : 4 R 255")
     print("Couleurs : R, G, B, N")
     print("N = eteindre")
     print("q = quitter")
@@ -44,7 +38,6 @@ def protocole_manuel():
 
         if commande.lower() == "q":
             break
-
         elements = commande.split()
 
         if len(elements) == 2:
