@@ -70,7 +70,7 @@ def destroy_motor():
 sensor = DistanceSensor(echo=24, trigger=23, max_distance=2, queue_len=1)
 
 # --- LEDs WS2812 ---
-leds = Adeept_SPI_LedPixel(8, 60)
+leds = Adeept_SPI_LedPixel(12, 60)
 
 # --- Phares ---
 phare_g = LED(9)
@@ -101,13 +101,12 @@ def checkdist():
     return d * 100
 
 
-def _set_hazard(on):
-    if on:
-        leds.set_all_led_color(255, 80, 0)
+def _set_leds(r, g, b, phares_on=False):
+    leds.set_all_led_color(r, g, b)
+    if phares_on:
         phare_g.on()
         phare_d.on()
     else:
-        leds.set_all_led_color(0, 0, 0)
         phare_g.off()
         phare_d.off()
 
@@ -118,13 +117,16 @@ def update_blink():
     if now - _last_blink >= 0.4:
         _blink = not _blink
         _last_blink = now
-        _set_hazard(_blink)
+        if _blink:
+            _set_leds(255, 0, 0, True)   # rouge + phares
+        else:
+            _set_leds(0, 0, 0, False)
 
 
 def start_move():
     global state, _warned
     _warned = False
-    _set_hazard(False)
+    _set_leds(0, 255, 0, False)   # vert au depart
     state = RUNNING
     if not drive_ramp(SPEED, 1, ramp_time=RAMP_TIME):
         obstacle_stop()
@@ -167,7 +169,7 @@ def read_cmd():
 
 def destroy():
     destroy_motor()
-    _set_hazard(False)
+    _set_leds(0, 0, 0, False)
     sensor.close()
 
 
@@ -201,9 +203,11 @@ if __name__ == "__main__":
                     obstacle_stop()
                 elif dist < WARNING_DIST and not _warned:
                     _warned = True
+                    _set_leds(255, 80, 0, True)    # orange + phares
                     print("-> ALERTE: obstacle a %.1f cm" % dist)
-                elif dist >= WARNING_DIST:
+                elif dist >= WARNING_DIST and _warned:
                     _warned = False
+                    _set_leds(0, 255, 0, False)    # retour vert
 
             elif state == OBSTACLE:
                 update_blink()
