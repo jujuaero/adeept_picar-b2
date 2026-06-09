@@ -29,7 +29,7 @@ LEDS = {
     7: (1, True),
     8: (5, True),
     9: (6, True)
-}
+    }
 
 
 def light_on(LED):
@@ -58,12 +58,29 @@ if __name__ == "__main__":
     while cmd >= 0:
         cmd = int(input("Choose between 11 and 29 or -1 to quit: "))
         if 11 <= cmd <= 19:
-			      light_on(LEDS[cmd - 10])
+            light_on(LEDS[cmd - 10])
         if 21 <= cmd <= 29:
             light_off(LEDS[cmd - 20])
         if cmd == 20:
             set_all_switch_off()
+        if cmd == 1:
+            light_on(LEDS[4])
+            light_on(LEDS[5])
+            light_on(LEDS[8])
+            light_on(LEDS[7])
+        if cmd == 2:
+            for i in range(10):
+                light_on(LEDS[4])
+                light_off(LEDS[9])
+                time.sleep(0.5)
+                light_off(LEDS[4])
+                light_on(LEDS[9])
+                time.sleep(0.5)
+            set_all_switch_off()
+        if cmd == -1:
+            set_all_switch_off()
         
-			
+            
 
-			
+        
+        
