@@ -3,34 +3,77 @@
 import time
 import sys
 import select
-import importlib.util
-import os
+from board import SCL, SDA
+import busio
+from adafruit_pca9685 import PCA9685
+from adafruit_motor import motor
 from gpiozero import DistanceSensor, LED
-
-# --- Import 04_motor (nom invalide comme module Python direct) ---
-_dir = os.path.dirname(os.path.abspath(__file__))
-_spec = importlib.util.spec_from_file_location(
-    "motor", os.path.join(_dir, "04_motor.py")
-)
-mot = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(mot)
-
 from spi_ws2812 import Adeept_SPI_LedPixel
+
+# --- Moteurs ---
+M1_IN1 = 15
+M1_IN2 = 14
+M2_IN1 = 12
+M2_IN2 = 13
+
+pwm    = None
+motor1 = None
+motor2 = None
+
+
+def setup():
+    global pwm, motor1, motor2
+    i2c = busio.I2C(SCL, SDA)
+    pwm = PCA9685(i2c, address=0x5f)
+    pwm.frequency = 50
+    motor1 = motor.DCMotor(pwm.channels[M1_IN1], pwm.channels[M1_IN2])
+    motor1.decay_mode = motor.SLOW_DECAY
+    motor2 = motor.DCMotor(pwm.channels[M2_IN1], pwm.channels[M2_IN2])
+    motor2.decay_mode = motor.SLOW_DECAY
+
+
+def stop():
+    motor1.throttle = 0
+    motor2.throttle = 0
+
+
+def drive(speed_pct, direction):
+    if direction == 0:
+        stop()
+        return
+    throttle = (max(0, min(100, speed_pct)) / 100.0) * direction
+    motor1.throttle =  throttle
+    motor2.throttle = -throttle
+
+
+def drive_ramp(speed_pct, direction, ramp_time=1.0):
+    steps = 50
+    delay = ramp_time / steps
+    for i in range(1, steps + 1):
+        drive(speed_pct * i / steps, direction)
+        time.sleep(delay)
+
+
+def destroy_motor():
+    stop()
+    pwm.deinit()
+
 
 # --- Capteur ultrason ---
 sensor = DistanceSensor(echo=24, trigger=23, max_distance=2)
 
-# --- LEDs WS2812 (8 LEDs, luminosite 60) ---
+# --- LEDs WS2812 ---
 leds = Adeept_SPI_LedPixel(8, 60)
 
-# --- Phares (LED GPIO) ---
+# --- Phares ---
 phare_g = LED(9)
 phare_d = LED(25)
 
 # --- Parametres ---
-SPEED         = 40    # % vitesse (reduite pour les tests)
-OBSTACLE_DIST = 20    # cm
-RAMP_TIME     = 0.5   # secondes
+CENTER_ANGLE  = 97.5
+SPEED         = 40   # % vitesse (reduite pour les tests)
+OBSTACLE_DIST = 20   # cm
+RAMP_TIME     = 0.5  # secondes
 
 # --- Etats ---
 STOPPED  = 0
@@ -69,21 +112,21 @@ def update_blink():
 def start_move():
     global state
     _set_hazard(False)
-    mot.drive_ramp(SPEED, 1, ramp_time=RAMP_TIME)
+    drive_ramp(SPEED, 1, ramp_time=RAMP_TIME)
     state = RUNNING
     print("-> Marche avant %d%%" % SPEED)
 
 
 def stop_robot(reason="manuel"):
     global state
-    mot.stop()
+    stop()
     state = STOPPED
     print("-> Arret (%s)" % reason)
 
 
 def obstacle_stop():
     global state, _last_blink
-    mot.stop()
+    stop()
     state = OBSTACLE
     _last_blink = 0.0
     print("-> OBSTACLE detecte ! Feux de detresse actives")
@@ -96,13 +139,13 @@ def read_cmd():
 
 
 def destroy():
-    mot.destroy()
+    destroy_motor()
     _set_hazard(False)
     sensor.close()
 
 
 if __name__ == "__main__":
-    mot.setup()
+    setup()
     leds.daemon = True
     leds.start()
 

@@ -3,6 +3,7 @@
 # Tache 4 : Moteur DC
 
 import time
+import os
 from board import SCL, SDA
 import busio
 from adafruit_pca9685 import PCA9685
@@ -14,6 +15,7 @@ M2_IN1 = 12
 M2_IN2 = 13
 
 SERVO_DIR_CH = 0
+CENTER_ANGLE = 97.5
 
 pwm       = None
 motor1    = None
@@ -37,7 +39,7 @@ def setup():
         pwm.channels[SERVO_DIR_CH],
         min_pulse=500, max_pulse=2400, actuation_range=180
     )
-    servo_dir.angle = 90
+    servo_dir.angle = CENTER_ANGLE
 
 
 def stop():
@@ -63,8 +65,21 @@ def drive_ramp(speed_pct, direction, ramp_time=1.0):
         time.sleep(delay)
 
 
+def _save_center(angle):
+    filepath = os.path.abspath(__file__)
+    with open(filepath, "r") as f:
+        lines = f.readlines()
+    for i, line in enumerate(lines):
+        if line.startswith("CENTER_ANGLE"):
+            lines[i] = "CENTER_ANGLE = " + str(angle) + "\n"
+            break
+    with open(filepath, "w") as f:
+        f.writelines(lines)
+    print("  -> CENTER_ANGLE = " + str(angle) + " ecrit dans 04_motor.py")
+
+
 def calibrate_servo():
-    angle = 90
+    angle = CENTER_ANGLE
     servo_dir.angle = angle
     print("")
     print("=== Etalonnage servo de direction ===")
@@ -73,7 +88,7 @@ def calibrate_servo():
     print("  c  : enregistrer comme centre")
     print("  q  : quitter")
 
-    center = 90
+    center = CENTER_ANGLE
     while True:
         cmd = input("  angle=" + str(angle) + " > ").strip()
         if cmd == "q":
@@ -88,7 +103,7 @@ def calibrate_servo():
             angle = max(0, angle - 1)
         elif cmd == "c":
             center = angle
-            print("  -> Centre enregistre : " + str(center))
+            _save_center(center)
             continue
         elif cmd.lstrip("-").isdigit():
             angle = max(0, min(180, int(cmd)))
