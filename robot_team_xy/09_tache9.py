@@ -1,70 +1,16 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 # Tache 9 : Marche avant et arret si obstacle
 
 import time
 import sys
 import select
-from board import SCL, SDA
-import busio
-from adafruit_pca9685 import PCA9685
-from adafruit_motor import motor, servo
+import importlib
 from gpiozero import DistanceSensor, LED
 from spi_ws2812 import Adeept_SPI_LedPixel
 
-# --- Moteurs ---
-M1_IN1 = 15
-M1_IN2 = 14
-M2_IN1 = 12
-M2_IN2 = 13
-
-pwm       = None
-motor1    = None
-motor2    = None
-servo_dir = None
-
-
-def setup():
-    global pwm, motor1, motor2, servo_dir
-    i2c = busio.I2C(SCL, SDA)
-    pwm = PCA9685(i2c, address=0x5f)
-    pwm.frequency = 50
-    motor1 = motor.DCMotor(pwm.channels[M1_IN1], pwm.channels[M1_IN2])
-    motor1.decay_mode = motor.SLOW_DECAY
-    motor2 = motor.DCMotor(pwm.channels[M2_IN1], pwm.channels[M2_IN2])
-    motor2.decay_mode = motor.SLOW_DECAY
-    servo_dir = servo.Servo(pwm.channels[0], min_pulse=500, max_pulse=2400, actuation_range=180)
-    servo_dir.angle = CENTER_ANGLE
-
-
-def stop():
-    motor1.throttle = 0
-    motor2.throttle = 0
-
-
-def drive(speed_pct, direction):
-    if direction == 0:
-        stop()
-        return
-    throttle = (max(0, min(100, speed_pct)) / 100.0) * direction
-    motor1.throttle =  throttle
-    motor2.throttle = -throttle
-
-
-def drive_ramp(speed_pct, direction, ramp_time=1.0):
-    steps = 50
-    delay = ramp_time / steps
-    for i in range(1, steps + 1):
-        if checkdist() < OBSTACLE_DIST:
-            stop()
-            return False
-        drive(speed_pct * i / steps, direction)
-        time.sleep(delay)
-    return True
-
-
-def destroy_motor():
-    stop()
-    pwm.deinit()
-
+# Import dynamique des moteurs car le fichier commence par un chiffre
+motor_drv = importlib.import_module("04_motor")
 
 # --- Capteur ultrason ---
 sensor = DistanceSensor(echo=24, trigger=23, max_distance=2, queue_len=1)
@@ -77,7 +23,6 @@ phare_g = LED(9)
 phare_d = LED(25)
 
 # --- Parametres ---
-CENTER_ANGLE  = 97.5
 SPEED         = 40   # % vitesse (reduite pour les tests)
 OBSTACLE_DIST = 20   # cm
 WARNING_DIST  = 40   # cm - seuil d'alerte avant arret
@@ -93,13 +38,11 @@ _blink        = False
 _last_blink   = 0.0
 _warned       = False
 
-
 def checkdist():
     d = sensor.distance
     if d is None:
         return 999
     return d * 100
-
 
 def _set_leds(r, g, b, phares_on=False):
     leds.set_all_led_color(r, g, b)
@@ -109,7 +52,6 @@ def _set_leds(r, g, b, phares_on=False):
     else:
         phare_g.off()
         phare_d.off()
-
 
 def update_blink():
     global _blink, _last_blink
@@ -122,28 +64,38 @@ def update_blink():
         else:
             _set_leds(0, 0, 0, False)
 
-
 def start_move():
     global state, _warned
     _warned = False
     _set_leds(0, 255, 0, False)   # vert au depart
     state = RUNNING
-    if not drive_ramp(SPEED, 1, ramp_time=RAMP_TIME):
+    
+    # On gère manuellement la rampe ici pour intégrer la verification ultrason
+    steps = 50
+    delay = RAMP_TIME / steps
+    hit_obstacle = False
+    for i in range(1, steps + 1):
+        if checkdist() < OBSTACLE_DIST:
+            motor_drv.stop()
+            hit_obstacle = True
+            break
+        motor_drv.drive(SPEED * i / steps, 1)
+        time.sleep(delay)
+        
+    if hit_obstacle:
         obstacle_stop()
     else:
         print("-> Marche avant %d%%" % SPEED)
 
-
 def stop_robot(reason="manuel"):
     global state
-    stop()
+    motor_drv.stop()
     state = STOPPED
     print("-> Arret (%s)" % reason)
 
-
 def obstacle_stop():
     global state, _last_blink
-    stop()
+    motor_drv.stop()
     state = OBSTACLE
     _last_blink = 0.0
     time.sleep(0.15)
@@ -160,21 +112,20 @@ def obstacle_stop():
     print("-> ARRET  : distance finale %.1f cm" % curr)
     print("-> OBSTACLE detecte ! Feux de detresse actives")
 
-
 def read_cmd():
     if select.select([sys.stdin], [], [], 0)[0]:
         return sys.stdin.readline().strip()
     return None
 
-
 def destroy():
-    destroy_motor()
+    motor_drv.stop()
+    if hasattr(motor_drv, 'pwm') and motor_drv.pwm:
+        motor_drv.pwm.deinit()
     _set_leds(0, 0, 0, False)
     sensor.close()
 
-
 if __name__ == "__main__":
-    setup()
+    motor_drv.setup()
     leds.daemon = True
     leds.start()
 
