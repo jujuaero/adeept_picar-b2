@@ -8,6 +8,9 @@ import select
 import importlib
 from gpiozero import DistanceSensor, LED
 from spi_ws2812 import Adeept_SPI_LedPixel
+from robot_team_xy._01_LedAvant import * as led
+from 05_ultrasond import * as ultra
+
 
 # Import dynamique des moteurs car le fichier commence par un chiffre
 motor_drv = importlib.import_module("04_motor")
