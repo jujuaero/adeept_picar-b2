@@ -13,7 +13,7 @@ M2_IN1 = 12
 M2_IN2 = 13
 
 SERVO_DIR_CH = 0
-CENTER_ANGLE = 3 # Angle utilisateur défini par défaut (0 = centre exact)
+CENTER_ANGLE = 6 # Angle utilisateur défini par défaut (0 = centre exact)
 
 motor1 = None
 motor2 = None
