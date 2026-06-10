@@ -50,6 +50,36 @@ def set_all_switch_off():
     for i in LEDS:
         light_off(LEDS[i])
 
+#preconstruct led patterns :
+
+def warning():
+    set_all_switch_off()
+    for i in range(10):
+        light_on(LEDS[4])
+        light_on(LEDS[7])
+        time.sleep(0.2)
+        light_off(LEDS[4])
+        light_off(LEDS[7])
+        time.sleep(0.2)
+    set_all_switch_off()
+
+def police():
+    set_all_switch_off()
+    for i in range(10):
+        light_on(LEDS[4])
+        light_off(LEDS[9])
+        time.sleep(0.5)
+        light_off(LEDS[4])
+        light_on(LEDS[9])
+        time.sleep(0.5)
+    set_all_switch_off()
+
+def phare():
+    set_all_switch_off()
+    light_on(LEDS[4])
+    light_on(LEDS[5])
+    light_on(LEDS[8])
+    light_on(LEDS[7])
 
 if __name__ == "__main__":
     cmd = 0
@@ -64,19 +94,11 @@ if __name__ == "__main__":
         if cmd == 20:
             set_all_switch_off()
         if cmd == 1:
-            light_on(LEDS[4])
-            light_on(LEDS[5])
-            light_on(LEDS[8])
-            light_on(LEDS[7])
+            phare()
         if cmd == 2:
-            for i in range(10):
-                light_on(LEDS[4])
-                light_off(LEDS[9])
-                time.sleep(0.5)
-                light_off(LEDS[4])
-                light_on(LEDS[9])
-                time.sleep(0.5)
-            set_all_switch_off()
+            police()
+        if cmd == 3:
+            warning()
         if cmd == -1:
             set_all_switch_off()
         
