@@ -1,5 +1,7 @@
 import RPi.GPIO as GPIO
 import time
+from music_player import *
+import threading
 
 def switchSetup():
     GPIO.setwarnings(False)
@@ -65,6 +67,7 @@ def warning():
 
 def police():
     set_all_switch_off()
+    threading.Thread(target=play, args=(Playlist["Police"],)).start()
     for i in range(10):
         light_on(LEDS[4])
         light_off(LEDS[9])

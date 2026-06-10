@@ -3,9 +3,10 @@
 # Tache 9 : Marche avant et arret si obstacle
 
 from threading import Thread
-from _01_LedAvant import * 
+from spi_ws2812 import Adeept_SPI_LedPixel
+from _01_LedAvant import warning as warning_led, switchSetup, set_all_switch_off
 from _05_ultrason import * 
-from _02_LedWS2812 import *
+from _02_LedWS2812 import warning as warning_ws2812
 from _04_motor import *
 
 
@@ -23,7 +24,8 @@ def arretUrgence(stop_distance,warning_distance):
         distance = checkdist()
         if distance < stop_distance :
             stop()
-            warning()
+            Thread(target=warning_led).start()
+            Thread(target=warning_ws2812).start()
             print("Obstacle detecte a %.2f mm - Arret!" % distance)
             return
         elif stop_distance <= distance < warning_distance:

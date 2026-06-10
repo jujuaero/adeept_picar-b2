@@ -1,8 +1,9 @@
 from spi_ws2812 import Adeept_SPI_LedPixel
-
+import time
 led = Adeept_SPI_LedPixel(14, 50, 'GRB')
 
 def set_led(numero_led, couleur, intensite=255):
+   
 
     if numero_led < 0 or numero_led > 13:
         print("Erreur : numero LED invalide")
@@ -28,7 +29,7 @@ def set_led(numero_led, couleur, intensite=255):
 
 def protocole_manuel():
     print("Commande : numero_led couleur intensite")
-    print("Exemple : 4 R 255")
+    print("Exemple : 3 R 255")
     print("Couleurs : R, G, B, N")
     print("N = eteindre")
     print("q = quitter")
@@ -38,6 +39,7 @@ def protocole_manuel():
 
         if commande.lower() == "q":
             break
+
         elements = commande.split()
 
         if len(elements) == 2:
@@ -58,10 +60,18 @@ def tout_eteindre():
     for i in range(14):
         set_led(i, "N")
 
-if __name__ == "__main__":
-    try:
-        tout_eteindre()
-        protocole_manuel()
-    finally:
-        tout_eteindre()
-        led.led_close()
+
+def warning():
+    for _ in range(10):
+        led.set_all_led_color(255, 0, 0)
+        time.sleep(0.2)
+
+        led.set_all_led_color(0, 0, 0)
+        time.sleep(0.2)
+try:
+    tout_eteindre()
+    protocole_manuel()
+
+finally:
+    tout_eteindre()
+    led.led_close()
