@@ -13,15 +13,28 @@ from _04_motor import *
 
 # --- Parametres ---
 SPEED  = 40   # % vitesse (reduite pour les tests)
-Distance_Obstacle = 2000# mm
-WARNING_DIST  = 400   # mm - seuil d'alerte avant arret
-STOP_DIST = 200
+distance= 2000# mm
+WARNING_DIST  = 800   # mm - seuil d'alerte avant arret
+STOP_DIST = 400
 RAMP_TIME     = 0.5  # secondes
-ENGINE=False
+
+
+def arretUrgence(stop_distance,warning_distance):
+    while True:
+        distance = checkdist()
+        if distance < stop_distance :
+            stop()
+            warning()
+            print("Obstacle detecte a %.2f mm - Arret!" % distance)
+            return
+        elif stop_distance <= distance < warning_distance:
+            print("Obstacle detecte a %.2f mm - Attention!" % distance)
 
 
 
 if __name__ == "__main__":
+    setup()
+    switchSetup()
     print("=== Tache 9 - Marche avant et arret obstacle ===")
     print("  M : demarrer en marche avant")
     print("  A : arret immediat")
@@ -29,23 +42,18 @@ if __name__ == "__main__":
     print()
     cmd = input("Commande : ").strip().upper()
     try:
-        Thread(target=checkdist, daemon=True).start()
+        Running = Thread(target=arretUrgence, args=(STOP_DIST, WARNING_DIST), daemon=True)
         while True:
-            if Distance_Obstacle < STOP_DIST:
-                stop()
-                print("Obstacle detecte a %.2f mm - Arret!" % Distance_Obstacle)
-                set_all_switch_off()
-                cmd = input("Commande : ").strip().upper()
-            if STOP_DIST < Distance_Obstacle <= WARNING_DIST:
-                print("Obstacle detecte a %.2f mm - Attention!" % Distance_Obstacle)
-                cmd = input("Commande : ").strip().upper()
-                ENGINE=False
-            if cmd == "M" and not ENGINE:
-                drive_ramp(SPEED, 1)
+            if cmd == "M":
+                Running.start()
+                drive_ramp(SPEED, 1,RAMP_TIME)
                 print("Marche avant...")
-                ENGINE = True
+                cmd ="waiting"
+            if not Running.is_alive():
+                cmd = input("Commande : ").strip().upper()
     except KeyboardInterrupt:
         print("\nFin de programme par Ctrl-C")
     finally:
         destroy()
+        set_all_switch_off()
         print("Nettoyage final realise")
