@@ -58,10 +58,10 @@ def tout_eteindre():
     for i in range(14):
         set_led(i, "N")
 
-try:
-    tout_eteindre()
-    protocole_manuel()
-
-finally:
-    tout_eteindre()
-    led.led_close()
+if __name__ == "__main__":
+    try:
+        tout_eteindre()
+        protocole_manuel()
+    finally:
+        tout_eteindre()
+        led.led_close()

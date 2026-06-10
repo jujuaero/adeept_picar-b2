@@ -4,81 +4,52 @@
 import time
 import sys
 import select
-import smbus
-import importlib
-from gpiozero import DistanceSensor, LED, TonalBuzzer
-from spi_ws2812 import Adeept_SPI_LedPixel
+from gpiozero import TonalBuzzer
 
-motor_drv = importlib.import_module("04_motor")
+import _04_motor as motor_drv
+import _05_ultrason as ultra_drv
+import _01_LedAvant as led_av
+import _02_LedWS2812 as led_ws
+import _09_lightTracking as light_drv
 
-def steer(angle):
-    if motor_drv.servo_dir:
-        motor_drv.servo_dir.angle = max(0, min(180, angle))
-
-
-# --- Capteur ultrason ---
-sensor = DistanceSensor(echo=24, trigger=23, max_distance=2, queue_len=1)
+def steer(user_angle):
+    motor_drv.set_angle(motor_drv.SERVO_DIR_CH, motor_drv.to_servo_angle(user_angle))
 
 
 # --- Capteur de lumiere (ADS7830) ---
-class ADS7830:
-    def __init__(self):
-        self.cmd = 0x84
-        self.bus = smbus.SMBus(1)
-        self.address = 0x48
-    def read(self, chn):
-        return self.bus.read_byte_data(
-            self.address, self.cmd | (((chn << 2 | chn >> 1) & 0x07) << 4)
-        )
-
-adc = ADS7830()
+adc = light_drv.ADS7830()
 
 # --- Buzzer ---
 buzzer = TonalBuzzer(18)
 
-# --- LEDs WS2812 ---
-leds = Adeept_SPI_LedPixel(12, 60)
-
-# --- Phares ---
-phare_g = LED(9)
-phare_d = LED(25)
-
 # --- Parametres ---
 CENTER_ANGLE  = motor_drv.CENTER_ANGLE
-STEER_ANGLE   = 30    # amplitude de virage en degres
-SPEED         = 40    # % vitesse avant
-REVERSE_SPEED = 25    # % vitesse recul
-REVERSE_TIME  = 2.0   # duree recul en secondes (~30 cm)
-OBSTACLE_DIST = 20    # cm
-WARNING_DIST  = 40    # cm
-LIGHT_BASE    = 127   # valeur ADC neutre (milieu de plage 0-255)
-LIGHT_THRESH  = 15    # zone morte autour de la baseline
+STEER_ANGLE   = 30
+SPEED         = 40
+REVERSE_SPEED = 25
+REVERSE_TIME  = 2.0
+OBSTACLE_DIST = 200   # mm
+WARNING_DIST  = 400   # mm
+LIGHT_BASE    = 127
+LIGHT_THRESH  = 15
 
 # --- Etats ---
 STOPPED = 0
 RUNNING = 1
 
 state   = STOPPED
-_blink  = False
-_last_blink = 0.0
 _warned = False
 
 
-def checkdist():
-    d = sensor.distance
-    if d is None:
-        return 999
-    return d * 100
-
-
-def _set_leds(r, g, b, phares_on=False):
-    leds.set_all_led_color(r, g, b)
+def _set_leds(couleur, phares_on=False):
+    for i in range(14):
+        led_ws.set_led(i, couleur)
     if phares_on:
-        phare_g.on()
-        phare_d.on()
+        led_av.light_on(led_av.LEDS[1])
+        led_av.light_on(led_av.LEDS[2])
     else:
-        phare_g.off()
-        phare_d.off()
+        led_av.light_off(led_av.LEDS[1])
+        led_av.light_off(led_av.LEDS[2])
 
 
 def _blink_red(duration):
@@ -91,14 +62,14 @@ def _blink_red(duration):
             blink = not blink
             t_last = now
             if blink:
-                _set_leds(255, 0, 0, True)
+                _set_leds("R", True)
             else:
-                _set_leds(0, 0, 0, False)
+                _set_leds("N", False)
         time.sleep(0.02)
 
 
 def track_light():
-    val = adc.read(1)
+    val = adc.analogRead(1)
     if val < LIGHT_BASE - LIGHT_THRESH:
         steer(CENTER_ANGLE + STEER_ANGLE)
     elif val > LIGHT_BASE + LIGHT_THRESH:
@@ -122,7 +93,7 @@ def obstacle_recovery():
     bip = False
     t_bip = time.time()
     while time.time() < t_end:
-        _set_leds(255, 0, 0, True)
+        _set_leds("R", True)
         if time.time() - t_bip >= 0.5:
             bip = not bip
             t_bip = time.time()
@@ -131,7 +102,7 @@ def obstacle_recovery():
 
     motor_drv.stop()
     buzzer.stop()
-    _set_leds(0, 0, 0, False)
+    _set_leds("N", False)
 
     # Pause 2 secondes
     print("-> Pause 2s")
@@ -139,7 +110,7 @@ def obstacle_recovery():
 
     # Reprise
     _warned = False
-    _set_leds(0, 255, 0, False)
+    _set_leds("G", False)
     state = RUNNING
     print("-> Reprise suivi lumiere")
 
@@ -149,14 +120,14 @@ def stop_robot(reason="manuel"):
     motor_drv.stop()
     steer(CENTER_ANGLE)
     state = STOPPED
-    _set_leds(0, 0, 0, False)
+    _set_leds("N", False)
     print("-> Arret (%s)" % reason)
 
 
 def start_move():
     global state, _warned
     _warned = False
-    _set_leds(0, 255, 0, False)
+    _set_leds("G", False)
     state = RUNNING
     print("-> Suivi lumiere demarre")
 
@@ -169,17 +140,16 @@ def read_cmd():
 
 def destroy():
     motor_drv.stop()
-    if hasattr(motor_drv, 'pwm') and motor_drv.pwm:
-        motor_drv.pwm.deinit()
+    motor_drv.destroy()
     buzzer.stop()
-    _set_leds(0, 0, 0, False)
-    sensor.close()
+    _set_leds("N", False)
+    led_av.set_all_switch_off()
 
 
 if __name__ == "__main__":
     motor_drv.setup()
-    leds.daemon = True
-    leds.start()
+    led_av.switchSetup()
+    led_av.set_all_switch_off()
 
     print("=== Tache 10 - Suivi lumiere et obstacle ===")
     print("  M : demarrer")
@@ -200,21 +170,21 @@ if __name__ == "__main__":
                     stop_robot(reason="manuel")
 
             if state == RUNNING:
-                dist = checkdist()
+                dist = ultra_drv.checkdist()
 
                 if dist < OBSTACLE_DIST:
                     motor_drv.stop()
-                    print("-> STOP  : obstacle a %.1f cm" % dist)
+                    print("-> STOP  : obstacle a %.0f mm" % dist)
                     obstacle_recovery()
 
                 elif dist < WARNING_DIST and not _warned:
                     _warned = True
-                    _set_leds(255, 80, 0, True)
-                    print("-> ALERTE: obstacle a %.1f cm" % dist)
+                    _set_leds("R", True)
+                    print("-> ALERTE: obstacle a %.0f mm" % dist)
 
                 elif dist >= WARNING_DIST and _warned:
                     _warned = False
-                    _set_leds(0, 255, 0, False)
+                    _set_leds("G", False)
 
                 if state == RUNNING:
                     track_light()
