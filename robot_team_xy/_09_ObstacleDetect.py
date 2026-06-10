@@ -4,7 +4,7 @@
 
 from threading import Thread
 from spi_ws2812 import Adeept_SPI_LedPixel
-from _01_LedAvant import warning as warning_led
+from _01_LedAvant import warning as warning_led, switchSetup, set_all_switch_off
 from _05_ultrason import * 
 from _02_LedWS2812 import warning as warning_ws2812
 from _04_motor import *
