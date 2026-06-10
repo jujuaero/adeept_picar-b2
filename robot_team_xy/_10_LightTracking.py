@@ -5,6 +5,7 @@ import time
 import sys
 import select
 from gpiozero import TonalBuzzer
+from threading import Thread
 
 import _04_motor as motor_drv
 import _05_ultrason as ultra_drv
@@ -12,6 +13,7 @@ import _01_LedAvant as led_av
 import _02_LedWS2812 as led_ws
 import _09_lightTracking as light_drv
 from _03_servo import *
+from _09_ObstacleDetect import *
 
 # --- Capteur de lumiere (ADS7830) ---
 adc = light_drv.ADS7830()
@@ -156,9 +158,11 @@ if __name__ == "__main__":
     print()
 
     try:
+        #Running = Thread(target=arretUrgence, args=(STOP_DIST, WARNING_DIST), daemon=True)
         while True:
+            #Running.start()
             cmd = read_cmd()
-
+            #if Running.is_alive():
             if cmd in ("M", "m"):
                 if state == STOPPED:
                     start_move()
@@ -186,7 +190,7 @@ if __name__ == "__main__":
 
                 if state == RUNNING:
                     track_light()
-
+            
             time.sleep(0.02)
 
     except KeyboardInterrupt:

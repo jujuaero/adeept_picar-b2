@@ -5,8 +5,8 @@
 import time
 import sys
 import select
-import importlib
 from gpiozero import DistanceSensor, InputDevice
+from threading import Thread
 
 from _04_motor import *
 from _03_servo import *
@@ -55,47 +55,46 @@ def follow_line():
     m = middle_sensor.value
     r = right_sensor.value
 
-    # Angles calculés autour du centre (par ex: 97.5)
-    center = CENTER_ANGLE
-    angle = center
+    # Angles calculés autour du centre (par ex: 6°)
+    angle = CENTER_ANGLE
 
     if l == 0 and m == 1 and r == 0:
         # Centré
-        angle = center
+        angle = CENTER_ANGLE
     elif l == 1 and m == 0 and r == 0:
         # Déviation à gauche
-        angle = center - 40
+        angle = CENTER_ANGLE - 40
     elif l == 1 and m == 1 and r == 0:
         # Légère déviation à gauche
-        angle = center - 25
+        angle = CENTER_ANGLE - 25
     elif l == 0 and m == 0 and r == 1:
         # Déviation à droite
-        angle = center + 40
+        angle = CENTER_ANGLE + 40
     elif l == 0 and m == 1 and r == 1:
         # Légère déviation à droite
-        angle = center + 25
+        angle = CENTER_ANGLE + 25
     elif l == 1 and m == 1 and r == 1:
         # Intersection droite -> on avance tout droit
-        angle = center
+        angle = CENTER_ANGLE
     elif l == 0 and m == 0 and r == 0:
         # Ligne perdue -> on maintient le dernier braquage prononcé
         angle = last_steer
     
     last_steer = angle
-    steer(angle)
+    set_angle(channel, angle)
     drive(SPEED, 1)
 
 def stop_robot(reason="manuel"):
     global state
     stop()
-    steer(CENTER_ANGLE)
+    set_angle(channel, CENTER_ANGLE)
     state = STOPPED
     print("-> Arret (%s)" % reason)
 
 def start_move():
     global state
     state = RUNNING
-    steer(CENTER_ANGLE)
+    set_angle(channel, CENTER_ANGLE)
     print("-> Suivi de ligne demarre")
 
 def read_cmd():
