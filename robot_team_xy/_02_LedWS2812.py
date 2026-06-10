@@ -62,12 +62,12 @@ def tout_eteindre():
 
 
 def warning():
-    for _ in range(5):
+    for _ in range(10):
         led.set_all_led_color(255, 0, 0)
-        time.sleep(0.3)
+        time.sleep(0.2)
 
         led.set_all_led_color(0, 0, 0)
-        time.sleep(0.3)
+        time.sleep(0.2)
 try:
     tout_eteindre()
     protocole_manuel()
