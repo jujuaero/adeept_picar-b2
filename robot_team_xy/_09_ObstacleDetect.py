@@ -17,6 +17,7 @@ Distance_Obstacle = 2000# mm
 WARNING_DIST  = 400   # mm - seuil d'alerte avant arret
 STOP_DIST = 200
 RAMP_TIME     = 0.5  # secondes
+ENGINE=False
 
 
 
@@ -38,9 +39,11 @@ if __name__ == "__main__":
             if STOP_DIST < Distance_Obstacle <= WARNING_DIST:
                 print("Obstacle detecte a %.2f mm - Attention!" % Distance_Obstacle)
                 cmd = input("Commande : ").strip().upper()
-            if cmd == "M":
-                drive_ramp(SPEED, 1, RAMP_TIME)
+                ENGINE=False
+            if cmd == "M" and not ENGINE:
+                drive_ramp(SPEED, 1)
                 print("Marche avant...")
+                ENGINE = True
     except KeyboardInterrupt:
         print("\nFin de programme par Ctrl-C")
     finally:
