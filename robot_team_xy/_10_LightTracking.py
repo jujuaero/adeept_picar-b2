@@ -11,10 +11,7 @@ import _05_ultrason as ultra_drv
 import _01_LedAvant as led_av
 import _02_LedWS2812 as led_ws
 import _09_lightTracking as light_drv
-
-def steer(user_angle):
-    motor_drv.set_angle(motor_drv.SERVO_DIR_CH, motor_drv.to_servo_angle(user_angle))
-
+from _03_servo import *
 
 # --- Capteur de lumiere (ADS7830) ---
 adc = light_drv.ADS7830()
@@ -23,7 +20,6 @@ adc = light_drv.ADS7830()
 buzzer = TonalBuzzer(18)
 
 # --- Parametres ---
-CENTER_ANGLE  = motor_drv.CENTER_ANGLE
 STEER_ANGLE   = 30
 SPEED         = 40
 REVERSE_SPEED = 25
@@ -32,6 +28,8 @@ OBSTACLE_DIST = 200   # mm
 WARNING_DIST  = 400   # mm
 LIGHT_BASE    = 127
 LIGHT_THRESH  = 15
+channel       = 0
+
 
 # --- Etats ---
 STOPPED = 0
@@ -71,11 +69,11 @@ def _blink_red(duration):
 def track_light():
     val = adc.analogRead(1)
     if val < LIGHT_BASE - LIGHT_THRESH:
-        steer(CENTER_ANGLE + STEER_ANGLE)
+        set_angle(channel, motor_drv.CENTER_ANGLE + STEER_ANGLE)
     elif val > LIGHT_BASE + LIGHT_THRESH:
-        steer(CENTER_ANGLE - STEER_ANGLE)
+        set_angle(channel, motor_drv.CENTER_ANGLE - STEER_ANGLE)
     else:
-        steer(CENTER_ANGLE)
+        set_angle(channel, motor_drv.CENTER_ANGLE)
     motor_drv.drive(SPEED, 1)
 
 
@@ -87,7 +85,7 @@ def obstacle_recovery():
 
     # Recul avec bip bip
     print("-> Recul ~30 cm avec bip bip")
-    steer(CENTER_ANGLE)
+    set_angle(channel, motor_drv.CENTER_ANGLE)
     motor_drv.drive(REVERSE_SPEED, -1)
     t_end = time.time() + REVERSE_TIME
     bip = False
@@ -118,7 +116,7 @@ def obstacle_recovery():
 def stop_robot(reason="manuel"):
     global state
     motor_drv.stop()
-    steer(CENTER_ANGLE)
+    set_angle(channel, motor_drv.CENTER_ANGLE)
     state = STOPPED
     _set_leds("N", False)
     print("-> Arret (%s)" % reason)

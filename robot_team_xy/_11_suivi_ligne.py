@@ -8,12 +8,11 @@ import select
 import importlib
 from gpiozero import DistanceSensor, InputDevice
 
-motor_drv = importlib.import_module("04_motor")
+from _04_motor import *
+from _03_servo import *
+from _11_lineTracking import *
 
-def steer(angle):
-    if motor_drv.servo_dir:
-        motor_drv.servo_dir.angle = max(0, min(180, angle))
-
+channel = 0
 # --- Capteur ultrason et Obstacles ---
 sensor = DistanceSensor(echo=24, trigger=23, max_distance=2, queue_len=1)
 OBSTACLE_DIST = 20    # cm
@@ -36,7 +35,7 @@ RUNNING = 1
 state = STOPPED
 
 # Dernière direction pour pouvoir retrouver la ligne
-last_steer = motor_drv.CENTER_ANGLE
+last_steer = CENTER_ANGLE
 
 def checkdist():
     d = sensor.distance
@@ -57,7 +56,7 @@ def follow_line():
     r = right_sensor.value
 
     # Angles calculés autour du centre (par ex: 97.5)
-    center = motor_drv.CENTER_ANGLE
+    center = CENTER_ANGLE
     angle = center
 
     if l == 0 and m == 1 and r == 0:
@@ -84,19 +83,19 @@ def follow_line():
     
     last_steer = angle
     steer(angle)
-    motor_drv.drive(SPEED, 1)
+    drive(SPEED, 1)
 
 def stop_robot(reason="manuel"):
     global state
-    motor_drv.stop()
-    steer(motor_drv.CENTER_ANGLE)
+    stop()
+    steer(CENTER_ANGLE)
     state = STOPPED
     print("-> Arret (%s)" % reason)
 
 def start_move():
     global state
     state = RUNNING
-    steer(motor_drv.CENTER_ANGLE)
+    steer(CENTER_ANGLE)
     print("-> Suivi de ligne demarre")
 
 def read_cmd():
@@ -105,13 +104,13 @@ def read_cmd():
     return None
 
 def destroy():
-    motor_drv.stop()
-    if hasattr(motor_drv, 'pwm') and motor_drv.pwm:
-        motor_drv.pwm.deinit()
+    stop()
+    if hasattr(motor_drv, 'pwm') and pwm:
+        pwm.deinit()
     sensor.close()
 
 if __name__ == "__main__":
-    motor_drv.setup()
+    setup()
     
     print("=== Tache 11 - Suivi de ligne ===")
     print("  M : demarrer le suivi")
@@ -135,7 +134,7 @@ if __name__ == "__main__":
                 dist = checkdist()
 
                 if dist < OBSTACLE_DIST:
-                    motor_drv.stop()
+                    stop()
                     if state == RUNNING:
                         print("-> STOP  : obstacle a %.1f cm" % dist)
                         state = STOPPED
