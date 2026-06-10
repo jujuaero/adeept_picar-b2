@@ -68,10 +68,12 @@ def warning():
 
         led.set_all_led_color(0, 0, 0)
         time.sleep(0.2)
-try:
-    tout_eteindre()
-    protocole_manuel()
 
-finally:
-    tout_eteindre()
-    led.led_close()
+if __name__ == "__main__":
+    try:
+        tout_eteindre()
+        protocole_manuel()
+
+    finally:
+        tout_eteindre()
+        led.led_close()

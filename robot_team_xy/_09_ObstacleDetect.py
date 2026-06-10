@@ -9,15 +9,12 @@ from _05_ultrason import *
 from _02_LedWS2812 import warning as warning_ws2812
 from _04_motor import *
 
-
-
 # --- Parametres ---
 SPEED  = 40   # % vitesse (reduite pour les tests)
 distance= 2000# mm
 WARNING_DIST  = 800   # mm - seuil d'alerte avant arret
 STOP_DIST = 400
 RAMP_TIME     = 0.5  # secondes
-
 
 def arretUrgence(stop_distance,warning_distance):
     while True:
