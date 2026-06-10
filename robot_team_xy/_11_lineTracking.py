@@ -14,6 +14,7 @@ line_pin_right = 17
 left = InputDevice(pin=line_pin_right)
 middle = InputDevice(pin=line_pin_middle)
 right = InputDevice(pin=line_pin_left)
+last_turn_angle = CENTER_ANGLE
 
 def run():
     status_right = right.value
@@ -22,17 +23,30 @@ def run():
     return f"{status_left}{status_middle}{status_right}"
 
 def angle(string):
+    global last_turn_angle
     angle = {
-        "000": 3,
+        "000": CENTER_ANGLE,
         "001": -20,
-        "010": 3,
+        "010": CENTER_ANGLE,
         "011": -40,
         "100": 25,
-        "101": 3,
+        "101": CENTER_ANGLE,
         "110": 45,
-        "111": 3
+        "111": CENTER_ANGLE
     }
+    if angle[string] in ["001", "011", "100", "110"]:
+        last_turn_angle = angle[string]
     return angle[string]
+
+def execute_recovery():
+    # On réduit la vitesse pour diminuer le rayon de braquage physique du robot
+    drive(15, 1)
+
+    # On braque au maximum selon le dernier sens enregistré
+    if last_turn_angle > 0:
+        return 45  # Braquage maximal vers un côté
+    else:
+        return -40 # Braquage maximal vers l'autre côté
 
 
 if __name__ == '__main__':
@@ -62,4 +76,3 @@ if __name__ == '__main__':
         stop()
         set_all_switch_off()
         print("Nettoyage final realise")
-
