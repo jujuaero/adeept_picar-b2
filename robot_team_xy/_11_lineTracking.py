@@ -1,10 +1,12 @@
-import time
+import time, sys, select
 import argparse
 from _04_motor import *
+import _01_LedAvant as led_av
+import _02_LedWS2812 as led_ws
 from _03_servo import *
-from _09_ObstacleDetect import arretUrgence
+from _09_ObstacleDetect import *
 from _01_LedAvant import *
-import threading
+from threading import Thread
 from gpiozero import InputDevice
 
 line_pin_left = 22
@@ -15,6 +17,13 @@ left = InputDevice(pin=line_pin_right)
 middle = InputDevice(pin=line_pin_middle)
 right = InputDevice(pin=line_pin_left)
 last_turn_angle = CENTER_ANGLE
+channel = 0
+
+# --- Etats ---
+STOPPED = 0
+RUNNING = 1
+
+state   = STOPPED
 
 def run():
     status_right = right.value
@@ -38,38 +47,60 @@ def angle(string):
         last_turn_angle = angle[string]
     return angle[string]
 
+def start_move():
+    global state
+    state = RUNNING
+    print("-> Suivi ligne demarre")
+
+def stop_robot(reason="manuel"):
+    global state
+    stop()
+    set_angle(channel, to_servo_angle(CENTER_ANGLE))
+    state = STOPPED
+    print("-> Arret (%s)" % reason)
+
 def execute_recovery():
-    # On réduit la vitesse pour diminuer le rayon de braquage physique du robot
+    # On reduit la vitesse pour diminuer le rayon de braquage physique du robot
     drive(15, 1)
 
-    # On braque au maximum selon le dernier sens enregistré
+    # On braque au maximum selon le dernier sens enregistre
     if last_turn_angle > 0:
-        return 45  # Braquage maximal vers un côté
+        return 45  # Braquage maximal vers un cote
     else:
-        return -40 # Braquage maximal vers l'autre côté
-
+        return -40 # Braquage maximal vers l'autre cote
+    
 
 if __name__ == '__main__':
     setup()
     switchSetup()
-    print("=== Tache 9 - Marche avant et arret obstacle ===")
+    print("=== Tache 11 - Suivi de ligne ===")
     print("  M : demarrer en marche avant")
     print("  A : arret immediat")
     print("  Ctrl-C : quitter")
     print()
     cmd = input("Commande : ").strip().upper()
     try:
-      ultra=threading.Thread(target=arretUrgence, args=(400, 600), daemon=True)
-      while True:
-        set_angle(0, to_servo_angle(angle(run())))
-        if cmd == "M":
-            ultra.start()
-            threading.Thread(target=police, daemon=True).start()
-            cmd="waiting"
-            drive_ramp(25, 1, 1)
-        if not ultra.is_alive():
-            cmd = "stoped"
-            cmd = input("Commande : ").strip().upper()
+        Running = Thread(target=arretUrgence, args=(STOP_DIST, WARNING_DIST), daemon=True)
+        Running.start()
+        while True:
+            if to_servo_angle(angle(run())) == 111:
+                execute_recovery()
+            else:
+                set_angle(0, to_servo_angle(angle(run())))
+            if cmd == "M":
+                if Running.is_alive() and state == STOPPED:
+                    drive_ramp(20, 1,RAMP_TIME)
+                    start_move()
+
+            elif cmd in ("A", "a"):
+                if state != STOPPED:
+                    stop_robot(reason="manuel")
+
+            if state == RUNNING:
+                if not Running.is_alive():
+                    state = STOPPED
+                    stop_robot(reason="manuel")
+            time.sleep(0.02)
     except KeyboardInterrupt:
         print("\nFin de programme par Ctrl-C")
     finally:
