@@ -34,14 +34,14 @@ def run():
 def angle(string):
     global last_turn_angle
     angle = {
-        "000": 0,
-        "001": 5,
-        "010": 0,
-        "011": 15,
-        "100": -5,
-        "101": 0,
-        "110": -15,
-        "111": 0
+        "000": 3,
+        "001": -20,
+        "010": 3,
+        "011": -40,
+        "100": 25,
+        "101": 3,
+        "110": 45,
+        "111": 3
     }
     if angle[string] in ["001", "011", "100", "110"]:
         last_turn_angle = angle[string]
@@ -81,29 +81,17 @@ if __name__ == '__main__':
     cmd = input("Commande : ").strip().upper()
     previous_angle=CENTER_ANGLE
     try:
-        Running = Thread(target=arretUrgence, args=(STOP_DIST, WARNING_DIST), daemon=True)
-        Running.start()
-        while True:
-            print(previous_angle)
-            ajustement=angle(run())
-            if -40<= previous_angle+ajustement <=50:
-                new_angle=previous_angle+ajustement 
-                set_angle(0, to_servo_angle(new_angle))
-                previous_angle=new_angle
-            if cmd == "M":
-                if Running.is_alive() and state == STOPPED:
-                    drive_ramp(30, 1,RAMP_TIME)
-                    start_move()
-
-            elif cmd == "A":
-                if state != STOPPED:
-                    stop_robot(reason="manuel")
-
-            if state == RUNNING:
-                if not Running.is_alive():
-                    state = STOPPED
-                    stop_robot(reason="manuel")
-            time.sleep(0.02)
+      ultra=threading.Thread(target=arretUrgence, args=(400, 600), daemon=True)
+      while True:
+        set_angle(0, to_servo_angle(angle(run())))
+        if cmd == "M":
+            ultra.start()
+            threading.Thread(target=police, daemon=True).start()
+            cmd="waiting"
+            drive_ramp(25, 1, 1)
+        if not ultra.is_alive():
+            cmd = "stoped"
+            cmd = input("Commande : ").strip().upper()
     except KeyboardInterrupt:
         print("\nFin de programme par Ctrl-C")
     finally:
