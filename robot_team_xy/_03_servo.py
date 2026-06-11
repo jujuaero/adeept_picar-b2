@@ -16,8 +16,11 @@ SERVO_RANGES = {
 }
 
 def set_angle(servo_id, angle):
-    s = servo.Servo(pca.channels[servo_id], min_pulse=500, max_pulse=2400, actuation_range=180)
-    s.angle = angle
+    if servo_id not in servos:
+        raise ValueError("Servo: 0,1,2")
+    else:
+        s = servo.Servo(pca.channels[servo_id], min_pulse=500, max_pulse=2400, actuation_range=180)
+        s.angle = angle
 
 
 def to_servo_angle(user_angle):
@@ -53,4 +56,3 @@ if __name__ == "__main__":
             print(f"OK servo {servo_id} -> {user_angle}")
         except ValueError as e:
             print(e)
-

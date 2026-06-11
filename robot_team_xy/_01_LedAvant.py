@@ -104,8 +104,3 @@ if __name__ == "__main__":
             warning()
         if cmd == -1:
             set_all_switch_off()
-        
-            
-
-        
-        
