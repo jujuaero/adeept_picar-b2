@@ -1,109 +1,125 @@
 import time, sys, select
-import argparse
 from _04_motor import *
-import _01_LedAvant as led_av
-import _02_LedWS2812 as led_ws
 from _03_servo import *
 from _09_ObstacleDetect import *
 from _01_LedAvant import *
 from threading import Thread
 from gpiozero import InputDevice
 
-line_pin_left = 22
+line_pin_left   = 22
 line_pin_middle = 27
-line_pin_right = 17
+line_pin_right  = 17
 
-left = InputDevice(pin=line_pin_right)
+# Note: pin assignment swapped intentionally to match physical sensor layout
+left   = InputDevice(pin=line_pin_right)
 middle = InputDevice(pin=line_pin_middle)
-right = InputDevice(pin=line_pin_left)
-last_turn_angle = CENTER_ANGLE
+right  = InputDevice(pin=line_pin_left)
+
 channel = 0
 
-# --- Etats ---
+# PD gains — si le robot oscille: baisser Kd; si trop lent a reagir: monter Kp
+Kp = 30
+Kd = 8
+
+SPEED_STRAIGHT = 35   # % vitesse ligne droite
+SPEED_TURNING  = 25   # % vitesse en virage
+SPEED_RECOVERY = 18   # % vitesse quand la ligne est perdue
+RECOVERY_ANGLE = 40   # degres de braquage lors de la recuperation
+
 STOPPED = 0
 RUNNING = 1
+state = STOPPED
 
-state   = STOPPED
+prev_error    = 0.0
+last_turn_dir = 0   # +1 = dernier virage a droite, -1 = gauche
 
-def run():
-    status_right = right.value
-    status_middle = middle.value
-    status_left = left.value
-    return f"{status_left}{status_middle}{status_right}"
+obstacle_thread = None
 
-def angle(string):
-    global last_turn_angle
-    angle = {
-        "000": 0,
-        "001": 5,
-        "010": 0,
-        "011": 15,
-        "100": -5,
-        "101": 0,
-        "110": -15,
-        "111": 0
-    }
-    if angle[string] in ["001", "011", "100", "110"]:
-        last_turn_angle = angle[string]
-    return angle[string]
+
+def weighted_error(l, m, r):
+    """Erreur de position normalisee : -1 (ligne a gauche) a +1 (ligne a droite).
+    Retourne None si la ligne est completement perdue."""
+    total = l + m + r
+    if total == 0:
+        return None
+    return (-l + r) / total
+
+
+def apply_steering(user_angle):
+    clamped = max(-45, min(50, user_angle))
+    set_angle(channel, to_servo_angle(clamped))
+
 
 def start_move():
-    global state
+    global state, obstacle_thread
+    obstacle_thread = Thread(target=arretUrgence, args=(STOP_DIST, WARNING_DIST), daemon=True)
+    obstacle_thread.start()
+    drive_ramp(SPEED_STRAIGHT, 1, RAMP_TIME)
     state = RUNNING
     print("-> Suivi ligne demarre")
+
 
 def stop_robot(reason="manuel"):
     global state
     stop()
-    set_angle(channel, to_servo_angle(CENTER_ANGLE))
+    apply_steering(CENTER_ANGLE)
     state = STOPPED
     print("-> Arret (%s)" % reason)
 
-def execute_recovery():
-    # On reduit la vitesse pour diminuer le rayon de braquage physique du robot
-    drive(15, 1)
 
-    # On braque au maximum selon le dernier sens enregistre
-    if last_turn_angle > 0:
-        return 45  # Braquage maximal vers un cote
-    else:
-        return -40 # Braquage maximal vers l'autre cote
-    
+def check_keyboard():
+    """Lecture clavier non-bloquante."""
+    if select.select([sys.stdin], [], [], 0)[0]:
+        return sys.stdin.readline().strip().upper()
+    return None
+
 
 if __name__ == '__main__':
     setup()
     switchSetup()
     print("=== Tache 11 - Suivi de ligne ===")
-    print("  M : demarrer en marche avant")
-    print("  A : arret immediat")
+    print("  M : demarrer")
+    print("  A : arret")
     print("  Ctrl-C : quitter")
-    print()
-    cmd = input("Commande : ").strip().upper()
-    previous_angle=CENTER_ANGLE
-    try:
-        Running = Thread(target=arretUrgence, args=(STOP_DIST, WARNING_DIST), daemon=True)
-        Running.start()
-        while True:
-            print(previous_angle)
-            ajustement=angle(run())
-            if -40<= previous_angle+ajustement <=50:
-                new_angle=previous_angle+ajustement 
-                set_angle(0, to_servo_angle(new_angle))
-                previous_angle=new_angle
-            if cmd == "M":
-                if Running.is_alive() and state == STOPPED:
-                    drive_ramp(30, 1,RAMP_TIME)
-                    start_move()
 
-            elif cmd == "A":
-                if state != STOPPED:
-                    stop_robot(reason="manuel")
+    try:
+        while True:
+            cmd = check_keyboard()
+            if cmd == "M" and state == STOPPED:
+                start_move()
+            elif cmd == "A" and state != STOPPED:
+                stop_robot(reason="manuel")
 
             if state == RUNNING:
-                if not Running.is_alive():
-                    state = STOPPED
-                    stop_robot(reason="manuel")
+                if obstacle_thread and not obstacle_thread.is_alive():
+                    stop_robot(reason="obstacle")
+                    continue
+
+                l, m, r = left.value, middle.value, right.value
+                error = weighted_error(l, m, r)
+
+                if error is None:
+                    # Ligne perdue : on ralentit et on braque fort dans le dernier sens connu
+                    drive(SPEED_RECOVERY, 1)
+                    recovery_angle = CENTER_ANGLE + RECOVERY_ANGLE * (last_turn_dir or 1)
+                    apply_steering(recovery_angle)
+                else:
+                    # Controleur PD : proportionnel + derive pour amortir les oscillations
+                    d_error  = error - prev_error
+                    steering = Kp * error + Kd * d_error
+                    apply_steering(CENTER_ANGLE + steering)
+
+                    if steering > 2:
+                        last_turn_dir = 1
+                    elif steering < -2:
+                        last_turn_dir = -1
+
+                    speed = SPEED_STRAIGHT if abs(steering) < 8 else SPEED_TURNING
+                    drive(speed, 1)
+                    prev_error = error
+
             time.sleep(0.02)
+
     except KeyboardInterrupt:
         print("\nFin de programme par Ctrl-C")
     finally:
