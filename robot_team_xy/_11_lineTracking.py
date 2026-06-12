@@ -21,15 +21,16 @@ channel = 0
 Kp = 30
 Kd = 8
 
-SPEED_STRAIGHT = 45   # % vitesse ligne droite
-SPEED_TURNING  = 35   # % vitesse en virage
+SPEED_STRAIGHT = 40   # % vitesse ligne droite
+SPEED_TURNING  = 30   # % vitesse en virage
 SPEED_RECOVERY = 30   # % vitesse quand la ligne est perdue
 RECOVERY_ANGLE = 40   # degres de braquage lors de la recuperation
 
 # Temps de manoeuvre (en secondes) pour la recuperation de ligne
+GRACE_PERIOD_TIME      = 0.3   # Temps pour franchir les trous ou amorcer un angle droit
 RECOVERY_BACKWARD_TIME = 0.8   # Temps de recul initial
-RECOVERY_FORWARD_TIME  = 0.5   # Temps pour la marche avant de recuperation
-RECOVERY_EXTRA_TIME    = 0.0   # Temps supplementaire de recul une fois la ligne retrouvee
+RECOVERY_FORWARD_TIME  = 0.2   # Temps pour la marche avant de recuperation
+RECOVERY_EXTRA_TIME    = 0.1   # Temps supplementaire de recul une fois la ligne retrouvee
 
 STOPPED = 0
 RUNNING = 1
@@ -110,36 +111,44 @@ if __name__ == '__main__':
                 error = weighted_error(l, m, r)
 
                 if error is None:
-                    # Ligne perdue : alternance de recul et d'avance
-                    if recovery_phase == 'BACKWARD':
-                        # Direction -1 pour reculer
+                    # Initialisation de la phase de grace a la perte de la ligne
+                    if recovery_phase is None:
+                        recovery_phase = 'GRACE'
+                        recovery_timer = time.time()
+
+                    # Phase 1: Tolerance pour les lignes discontinues et angles droits
+                    if recovery_phase == 'GRACE':
+                        drive(SPEED_RECOVERY, 1)
+                        # On force le virage dans le dernier sens connu a l'aveugle
+                        grace_angle = CENTER_ANGLE + RECOVERY_ANGLE * (last_turn_dir or 1)
+                        apply_steering(grace_angle)
+
+                        if time.time() - recovery_timer > GRACE_PERIOD_TIME:
+                            # Echec de la recuperation rapide, on passe au recul
+                            recovery_phase = 'BACKWARD'
+                            recovery_timer = time.time()
+
+                    # Phase 2: Recul
+                    elif recovery_phase == 'BACKWARD':
                         drive(SPEED_RECOVERY, -1) 
-                        # Braque dans le sens INVERSE du dernier virage
                         recovery_angle = CENTER_ANGLE - RECOVERY_ANGLE * (last_turn_dir or 1)
                         apply_steering(recovery_angle)
                         
-                        # Change de direction apres le temps defini
                         if time.time() - recovery_timer > RECOVERY_BACKWARD_TIME: 
                             recovery_phase = 'FORWARD'
                             recovery_timer = time.time()
                             
+                    # Phase 3: Avance
                     elif recovery_phase == 'FORWARD':
-                        # Direction 1 pour avancer
                         drive(SPEED_RECOVERY, 1) 
-                        # Braque dans le sens NORMAL pour retrouver la ligne
                         recovery_angle = CENTER_ANGLE + RECOVERY_ANGLE * (last_turn_dir or 1)
                         apply_steering(recovery_angle)
                         
-                        # Change de direction apres le temps defini
                         if time.time() - recovery_timer > RECOVERY_FORWARD_TIME:
+                            # On recommence la boucle de recul si toujours perdu
                             recovery_phase = 'BACKWARD'
                             recovery_timer = time.time()
                             
-                    else:
-                        # Initialisation de la phase de recuperation
-                        # (Gere aussi le cas ou il reperd la ligne pendant l'extra)
-                        recovery_phase = 'BACKWARD'
-                        recovery_timer = time.time()
                 else:
                     # Ligne detectee
                     if recovery_phase == 'BACKWARD':
@@ -147,7 +156,7 @@ if __name__ == '__main__':
                         recovery_phase = 'BACKWARD_EXTRA'
                         recovery_timer = time.time()
                         
-                    if recovery_phase == 'BACKWARD_EXTRA':
+                    elif recovery_phase == 'BACKWARD_EXTRA':
                         # On continue le recul avec le meme braquage
                         drive(SPEED_RECOVERY, -1)
                         recovery_angle = CENTER_ANGLE - RECOVERY_ANGLE * (last_turn_dir or 1)
@@ -158,7 +167,7 @@ if __name__ == '__main__':
                             recovery_phase = None
                             
                     else:
-                        # Ligne retrouvee en marche avant ou suivi normal
+                        # Ligne retrouvee en marche avant (y compris pendant la phase de GRACE)
                         recovery_phase = None 
                         
                         # Controleur PD : proportionnel + derive pour amortir les oscillations
@@ -166,6 +175,7 @@ if __name__ == '__main__':
                         steering = Kp * error + Kd * d_error
                         apply_steering(CENTER_ANGLE + steering)
 
+                        # On enregistre la direction pour anticiper les pertes de ligne
                         if steering > 2:
                             last_turn_dir = 1
                         elif steering < -2:
