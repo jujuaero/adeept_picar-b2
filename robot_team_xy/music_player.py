@@ -27,10 +27,27 @@ URSS = [
     ["C5", 0.8],["B4", 0.4],["A4", 0.4],["G4", 1.2],
 ]
 
+
+Zelda = [ 
+    ["A4", 0.15],["B4", 0.15],["C#4", 0.15],["D#4", 0.15],
+    ["A4", 0.15],["B4", 0.15],["C#4", 0.15],["D#4", 0.15],
+    ["Bb4", 0.15],["C4", 0.15],["D4", 0.15],["E4", 0.15],
+    ["Bb4", 0.15],["C4", 0.15],["D4", 0.15],["E4", 0.15],
+    ["B4", 0.15],["C#4", 0.15],["D#4", 0.15],["E#4", 0.15],
+    ["C4", 0.15],["D4", 0.15],["E4", 0.15],["F#4", 0.15],
+    ["C#4", 0.15],["D#4", 0.15],["F4", 0.15],["G4", 0.15],
+    ["D4", 0.15],["E4", 0.15],["F#4", 0.15],["G#4", 0.15],
+    [None, 0.6],
+    ["A4", 0.3],
+    ["A#4", 0.3],
+    ["B4", 0.3],
+    ["C5", 1],
+]
 Playlist = {
     "Default" : Default,
     "Police" : Police,
-    "URSS" : URSS
+    "URSS" : URSS,
+    "Zelda" : Zelda
     }
 def play(tune):
     """
@@ -46,7 +63,7 @@ def play(tune):
 
 if __name__ == "__main__":
     try:
-        play(Playlist[input("Choisir Musique : Default, Police, URSS ")])  # Execute the play function to start playing the tune.
+        play(Playlist[input("Choisir Musique : Default, Police, URSS, Zelda")])  # Execute the play function to start playing the tune.
 
     except KeyboardInterrupt:
         # Handle KeyboardInterrupt for graceful termination
