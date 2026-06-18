@@ -26,23 +26,28 @@ channel = 0
 Kp = 24
 Kd = 5
 
-SPEED_STRAIGHT = 52
-SPEED_MIN_PREDICTIVE = 24
-SPEED_GRACE = 28
-SPEED_RECOVERY = 20
+SPEED_STRAIGHT = 95
+SPEED_MIN_PREDICTIVE = 5
+SPEED_GRACE = 42
+SPEED_RECOVERY = 18
 
 MAX_STEERING_DELTA = 38
 GRACE_MAX_STEERING = 22
 RECOVERY_ANGLE = 38
 
 GRACE_PERIOD_TIME = 0.65
-RECOVERY_BACKWARD_TIME = 0.25
-RECOVERY_FORWARD_TIME = 0.18
+RECOVERY_BACKWARD_TIME = 0.55
+RECOVERY_FORWARD_TIME = 0.30
+RECOVERY_SETTLE_TIME = 0.05
 LOST_LINE_CONFIRM_CYCLES = 5
 
-SPEED_STEP_UP = 3
-SPEED_STEP_DOWN = 8
+SPEED_STEP_UP = 8
+SPEED_STEP_DOWN = 14
 HISTORY_LEN = 20
+TURN_SLOWDOWN_START_PERCENT = 18
+TURN_SLOWDOWN_EXPONENT = 1.65
+RECOVERY_FORWARD_ANGLE_SCALE = 0.82
+RECOVERY_SWITCH_SIDE_AFTER = 4
 
 STOPPED = 0
 RUNNING = 1
@@ -57,6 +62,8 @@ recovery_timer = 0.0
 current_speed = 0
 obstacle_thread = None
 obstacle_stop_event = None
+recovery_direction = 1
+recovery_attempt = 0
 
 error_history = deque(maxlen=HISTORY_LEN)
 pattern_history = deque(maxlen=HISTORY_LEN)
@@ -124,12 +131,18 @@ def predicted_turn_percent(current_error):
 
 
 def speed_for_turn_percent(turn_percent):
-    turn_ratio = clamp01(turn_percent / 100.0)
+    if turn_percent <= TURN_SLOWDOWN_START_PERCENT:
+        return SPEED_STRAIGHT
+
+    turn_ratio = clamp01(
+        (turn_percent - TURN_SLOWDOWN_START_PERCENT)
+        / (100.0 - TURN_SLOWDOWN_START_PERCENT)
+    )
     speed_span = SPEED_STRAIGHT - SPEED_MIN_PREDICTIVE
 
-    # Courbe non lineaire: on garde de la vitesse tant que le score est modere,
-    # puis on ralentit plus franchement quand le virage predit devient severe.
-    target_speed = SPEED_STRAIGHT - speed_span * (turn_ratio ** 1.35)
+    # Zone franche en ligne droite, puis ralentissement progressif seulement
+    # quand la prediction de virage devient significative.
+    target_speed = SPEED_STRAIGHT - speed_span * (turn_ratio ** TURN_SLOWDOWN_EXPONENT)
     return int(round(max(SPEED_MIN_PREDICTIVE, min(SPEED_STRAIGHT, target_speed))))
 
 
@@ -137,6 +150,7 @@ def start_move():
     global state, obstacle_thread, obstacle_stop_event
     global prev_error, last_steering, last_turn_dir, lost_line_count
     global recovery_phase, recovery_timer, current_speed
+    global recovery_direction, recovery_attempt
 
     obstacle_stop_event = Event()
     obstacle_thread = Thread(
@@ -153,6 +167,8 @@ def start_move():
     recovery_phase = None
     recovery_timer = 0.0
     current_speed = 0
+    recovery_direction = 1
+    recovery_attempt = 0
     error_history.clear()
     pattern_history.clear()
 
@@ -163,6 +179,7 @@ def start_move():
 
 def stop_robot(reason="manuel"):
     global state, obstacle_thread, obstacle_stop_event, current_speed
+    global recovery_phase, recovery_attempt
 
     if obstacle_stop_event is not None:
         obstacle_stop_event.set()
@@ -172,6 +189,8 @@ def stop_robot(reason="manuel"):
     obstacle_thread = None
     obstacle_stop_event = None
     current_speed = 0
+    recovery_phase = None
+    recovery_attempt = 0
     stop()
     apply_steering(CENTER_ANGLE)
     state = STOPPED
@@ -225,6 +244,8 @@ if __name__ == "__main__":
                     if recovery_phase is None:
                         recovery_phase = "GRACE"
                         recovery_timer = time.time()
+                        recovery_direction = last_turn_dir or (1 if last_steering >= 0 else -1)
+                        recovery_attempt = 0
 
                     if recovery_phase == "GRACE":
                         held_steering = max(
@@ -235,30 +256,53 @@ if __name__ == "__main__":
                         set_drive_speed(SPEED_GRACE, 1)
 
                         if time.time() - recovery_timer > GRACE_PERIOD_TIME:
+                            recovery_phase = "SETTLE_BACKWARD"
+                            recovery_timer = time.time()
+
+                    elif recovery_phase == "SETTLE_BACKWARD":
+                        stop()
+                        apply_steering(CENTER_ANGLE)
+
+                        if time.time() - recovery_timer > RECOVERY_SETTLE_TIME:
                             recovery_phase = "BACKWARD"
                             recovery_timer = time.time()
 
                     elif recovery_phase == "BACKWARD":
-                        recovery_angle = CENTER_ANGLE - RECOVERY_ANGLE * (last_turn_dir or 1)
+                        recovery_angle = CENTER_ANGLE - RECOVERY_ANGLE * recovery_direction
                         apply_steering(recovery_angle)
                         set_drive_speed(SPEED_RECOVERY, -1)
 
                         if time.time() - recovery_timer > RECOVERY_BACKWARD_TIME:
+                            recovery_phase = "SETTLE_FORWARD"
+                            recovery_timer = time.time()
+
+                    elif recovery_phase == "SETTLE_FORWARD":
+                        stop()
+                        apply_steering(CENTER_ANGLE)
+
+                        if time.time() - recovery_timer > RECOVERY_SETTLE_TIME:
                             recovery_phase = "FORWARD"
                             recovery_timer = time.time()
 
                     elif recovery_phase == "FORWARD":
-                        recovery_angle = CENTER_ANGLE + RECOVERY_ANGLE * (last_turn_dir or 1)
+                        recovery_angle = CENTER_ANGLE + (
+                            RECOVERY_ANGLE * RECOVERY_FORWARD_ANGLE_SCALE * recovery_direction
+                        )
                         apply_steering(recovery_angle)
-                        set_drive_speed(SPEED_RECOVERY, 1)
+                        set_drive_speed(SPEED_GRACE, 1)
 
                         if time.time() - recovery_timer > RECOVERY_FORWARD_TIME:
-                            recovery_phase = "BACKWARD"
+                            recovery_attempt += 1
+                            if recovery_attempt >= RECOVERY_SWITCH_SIDE_AFTER:
+                                recovery_direction *= -1
+                                recovery_attempt = 0
+                            recovery_phase = "SETTLE_BACKWARD"
                             recovery_timer = time.time()
 
                 else:
                     lost_line_count = 0
                     recovery_phase = None
+                    recovery_attempt = 0
 
                     error_history.append(error)
                     pattern_history.append(pattern)
