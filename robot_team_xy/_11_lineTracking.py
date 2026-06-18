@@ -18,27 +18,29 @@ right  = InputDevice(pin=line_pin_left)
 channel = 0
 
 # PD gains - si le robot oscille: baisser Kd; si trop lent a reagir: monter Kp
-Kp = 18
-Kd = 4
+Kp = 24
+Kd = 5
 
-SPEED_STRAIGHT = 40   # % vitesse ligne droite
-SPEED_TURNING  = 25   # % vitesse en virage
-SPEED_RECOVERY = 20   # % vitesse quand la ligne est perdue
-RECOVERY_ANGLE = 28   # degres de braquage lors de la recuperation
-MAX_STEERING_DELTA = 28  # limite de braquage autour du centre
+SPEED_STRAIGHT = 50   # % vitesse ligne droite
+SPEED_TURNING  = 32   # % vitesse en virage
+SPEED_RECOVERY = 24   # % vitesse quand la ligne est perdue
+RECOVERY_ANGLE = 35   # degres de braquage lors de la recuperation
+MAX_STEERING_DELTA = 36  # limite de braquage autour du centre
+GRACE_MAX_STEERING = 18  # braquage max conserve pendant un trou de ligne
 
 # Temps de manoeuvre (en secondes) pour la recuperation de ligne
-GRACE_PERIOD_TIME      = 0.12  # Temps pour franchir un petit trou sans panique
-RECOVERY_BACKWARD_TIME = 0.5   # Temps de recul initial
+GRACE_PERIOD_TIME      = 0.55  # Tolere un long pointille avant de lancer une recovery
+RECOVERY_BACKWARD_TIME = 0.3   # Temps de recul initial
 RECOVERY_FORWARD_TIME  = 0.15  # Temps pour la marche avant de recuperation
 RECOVERY_EXTRA_TIME    = 0.05  # Temps supplementaire de recul une fois la ligne retrouvee
-LOST_LINE_CONFIRM_CYCLES = 3   # Nombre de lectures consecutives perdues avant recovery
+LOST_LINE_CONFIRM_CYCLES = 5   # Nombre de lectures consecutives perdues avant recovery
 
 STOPPED = 0
 RUNNING = 1
 state = STOPPED
 
 prev_error    = 0.0
+last_steering = 0.0
 last_turn_dir = 0   # +1 = dernier virage a droite, -1 = gauche
 
 # Variables pour la recuperation de ligne
@@ -69,7 +71,8 @@ def apply_steering(user_angle):
 
 def start_move():
     global state, obstacle_thread, obstacle_stop_event
-    global prev_error, last_turn_dir, recovery_phase, recovery_timer, lost_line_count
+    global prev_error, last_steering, last_turn_dir
+    global recovery_phase, recovery_timer, lost_line_count
 
     obstacle_stop_event = Event()
     obstacle_thread = Thread(
@@ -81,6 +84,7 @@ def start_move():
     drive_ramp(SPEED_STRAIGHT, 1, RAMP_TIME)
     state = RUNNING
     prev_error = 0.0
+    last_steering = 0.0
     last_turn_dir = 0
     recovery_phase = None
     recovery_timer = 0.0
@@ -149,9 +153,13 @@ if __name__ == '__main__':
 
                     # Phase 1: Tolerance pour les lignes discontinues et angles droits
                     if recovery_phase == 'GRACE':
-                        drive(SPEED_RECOVERY, 1)
-                        # On force le virage dans le dernier sens connu a l'aveugle
-                        grace_angle = CENTER_ANGLE + RECOVERY_ANGLE * (last_turn_dir or 1)
+                        drive(SPEED_TURNING, 1)
+                        # Sur un trou de ligne, on conserve un cap raisonnable
+                        grace_steering = max(
+                            -GRACE_MAX_STEERING,
+                            min(GRACE_MAX_STEERING, last_steering),
+                        )
+                        grace_angle = CENTER_ANGLE + grace_steering
                         apply_steering(grace_angle)
 
                         if time.time() - recovery_timer > GRACE_PERIOD_TIME:
@@ -206,6 +214,7 @@ if __name__ == '__main__':
                         d_error  = error - prev_error
                         steering = Kp * error + Kd * d_error
                         apply_steering(CENTER_ANGLE + steering)
+                        last_steering = steering
 
                         # On enregistre la direction pour anticiper les pertes de ligne
                         if steering > 2:
