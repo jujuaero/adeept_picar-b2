@@ -14,6 +14,7 @@ SERVO_RANGES = {
     1: (-90, 90),
     2: (-90, 90),
 }
+servos = [0, 1, 2]
 
 def set_angle(servo_id, angle):
     if servo_id not in servos:
@@ -29,7 +30,6 @@ def to_servo_angle(user_angle):
     return user_angle + 90
 
 if __name__ == "__main__":
-    servos = [0, 1, 2]
     print("Commande: <servo> <angle> (ex: 1 30), quit")
     print("Plage angle servo 0: -45..50")
     print("Plage angle servos 1/2: -90..90")

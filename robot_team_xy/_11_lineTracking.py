@@ -3,7 +3,7 @@ from _04_motor import *
 from _03_servo import *
 from _09_ObstacleDetect import *
 from _01_LedAvant import *
-from threading import Thread
+from threading import Event, Thread
 from gpiozero import InputDevice
 
 line_pin_left   = 22
@@ -18,19 +18,21 @@ right  = InputDevice(pin=line_pin_left)
 channel = 0
 
 # PD gains - si le robot oscille: baisser Kd; si trop lent a reagir: monter Kp
-Kp = 30
-Kd = 8
+Kp = 18
+Kd = 4
 
 SPEED_STRAIGHT = 40   # % vitesse ligne droite
-SPEED_TURNING  = 30   # % vitesse en virage
-SPEED_RECOVERY = 30   # % vitesse quand la ligne est perdue
-RECOVERY_ANGLE = 40   # degres de braquage lors de la recuperation
+SPEED_TURNING  = 25   # % vitesse en virage
+SPEED_RECOVERY = 20   # % vitesse quand la ligne est perdue
+RECOVERY_ANGLE = 28   # degres de braquage lors de la recuperation
+MAX_STEERING_DELTA = 28  # limite de braquage autour du centre
 
 # Temps de manoeuvre (en secondes) pour la recuperation de ligne
-GRACE_PERIOD_TIME      = 0.3   # Temps pour franchir les trous ou amorcer un angle droit
-RECOVERY_BACKWARD_TIME = 0.8   # Temps de recul initial
-RECOVERY_FORWARD_TIME  = 0.2   # Temps pour la marche avant de recuperation
-RECOVERY_EXTRA_TIME    = 0.1   # Temps supplementaire de recul une fois la ligne retrouvee
+GRACE_PERIOD_TIME      = 0.12  # Temps pour franchir un petit trou sans panique
+RECOVERY_BACKWARD_TIME = 0.5   # Temps de recul initial
+RECOVERY_FORWARD_TIME  = 0.15  # Temps pour la marche avant de recuperation
+RECOVERY_EXTRA_TIME    = 0.05  # Temps supplementaire de recul une fois la ligne retrouvee
+LOST_LINE_CONFIRM_CYCLES = 3   # Nombre de lectures consecutives perdues avant recovery
 
 STOPPED = 0
 RUNNING = 1
@@ -42,8 +44,10 @@ last_turn_dir = 0   # +1 = dernier virage a droite, -1 = gauche
 # Variables pour la recuperation de ligne
 recovery_phase = None
 recovery_timer = 0.0
+lost_line_count = 0
 
 obstacle_thread = None
+obstacle_stop_event = None
 
 
 def weighted_error(l, m, r):
@@ -56,23 +60,43 @@ def weighted_error(l, m, r):
 
 
 def apply_steering(user_angle):
-    clamped = max(-45, min(50, user_angle))
-    set_angle(1, to_servo_angle(clamped))
+    clamped = max(
+        CENTER_ANGLE - MAX_STEERING_DELTA,
+        min(CENTER_ANGLE + MAX_STEERING_DELTA, user_angle),
+    )
     set_angle(channel, to_servo_angle(clamped))
 
 
 def start_move():
-    global state, obstacle_thread, recovery_phase
-    obstacle_thread = Thread(target=arretUrgence, args=(STOP_DIST, WARNING_DIST), daemon=True)
+    global state, obstacle_thread, obstacle_stop_event
+    global prev_error, last_turn_dir, recovery_phase, recovery_timer, lost_line_count
+
+    obstacle_stop_event = Event()
+    obstacle_thread = Thread(
+        target=arretUrgence,
+        args=(STOP_DIST, WARNING_DIST, obstacle_stop_event),
+        daemon=True,
+    )
     obstacle_thread.start()
     drive_ramp(SPEED_STRAIGHT, 1, RAMP_TIME)
     state = RUNNING
+    prev_error = 0.0
+    last_turn_dir = 0
     recovery_phase = None
+    recovery_timer = 0.0
+    lost_line_count = 0
     print("-> Suivi ligne demarre")
 
 
 def stop_robot(reason="manuel"):
-    global state
+    global state, obstacle_thread, obstacle_stop_event
+
+    if obstacle_stop_event is not None:
+        obstacle_stop_event.set()
+    if obstacle_thread and obstacle_thread.is_alive():
+        obstacle_thread.join(timeout=0.2)
+    obstacle_thread = None
+    obstacle_stop_event = None
     stop()
     apply_steering(CENTER_ANGLE)
     state = STOPPED
@@ -111,6 +135,13 @@ if __name__ == '__main__':
                 error = weighted_error(l, m, r)
 
                 if error is None:
+                    lost_line_count += 1
+
+                    if lost_line_count < LOST_LINE_CONFIRM_CYCLES:
+                        # Petit trou de ligne: on garde une marche avant douce
+                        drive(SPEED_TURNING, 1)
+                        continue
+
                     # Initialisation de la phase de grace a la perte de la ligne
                     if recovery_phase is None:
                         recovery_phase = 'GRACE'
@@ -150,6 +181,7 @@ if __name__ == '__main__':
                             recovery_timer = time.time()
                             
                 else:
+                    lost_line_count = 0
                     # Ligne detectee
                     if recovery_phase == 'BACKWARD':
                         # Ligne retrouvee pendant le recul : on amorce le temps supplementaire

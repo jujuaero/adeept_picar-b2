@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Tache 9 : Marche avant et arret si obstacle
 
+import time
 from threading import Thread
 from spi_ws2812 import Adeept_SPI_LedPixel
 from _01_LedAvant import warning as warning_led, switchSetup, set_all_switch_off
@@ -16,8 +17,11 @@ WARNING_DIST  = 800   # mm - seuil d'alerte avant arret
 STOP_DIST = 400
 RAMP_TIME     = 0.5  # secondes
 
-def arretUrgence(stop_distance,warning_distance):
+def arretUrgence(stop_distance, warning_distance, stop_event=None):
     while True:
+        if stop_event is not None and stop_event.is_set():
+            return
+
         distance = checkdist()
         if distance < stop_distance :
             stop()
@@ -27,6 +31,8 @@ def arretUrgence(stop_distance,warning_distance):
             return
         elif stop_distance <= distance < warning_distance:
             print("Obstacle detecte a %.2f mm - Attention!" % distance)
+
+        time.sleep(0.05)
 
 
 
