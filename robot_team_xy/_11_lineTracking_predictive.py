@@ -23,19 +23,22 @@ right = InputDevice(pin=line_pin_left)
 channel = 0
 
 # PD gains: enough authority to take turns, but less twitchy than the original.
-Kp = 24
-Kd = 5
+Kp = 28
+Kd = 6
+Kf = 18
 
-SPEED_STRAIGHT = 95
-SPEED_MIN_PREDICTIVE = 5
-SPEED_GRACE = 42
+SPEED_STRAIGHT = 60
+SPEED_MIN_PREDICTIVE = 18
+SPEED_GRACE = 40
+SPEED_SEARCH_FORWARD = 30
 SPEED_RECOVERY = 18
 
-MAX_STEERING_DELTA = 38
-GRACE_MAX_STEERING = 22
-RECOVERY_ANGLE = 38
+MAX_STEERING_DELTA = 46
+GRACE_MAX_STEERING = 34
+RECOVERY_ANGLE = 44
 
-GRACE_PERIOD_TIME = 0.65
+GRACE_PERIOD_TIME = 0.40
+SEARCH_FORWARD_TIME = 0.55
 RECOVERY_BACKWARD_TIME = 0.55
 RECOVERY_FORWARD_TIME = 0.30
 RECOVERY_SETTLE_TIME = 0.05
@@ -44,10 +47,11 @@ LOST_LINE_CONFIRM_CYCLES = 5
 SPEED_STEP_UP = 8
 SPEED_STEP_DOWN = 14
 HISTORY_LEN = 20
-TURN_SLOWDOWN_START_PERCENT = 18
-TURN_SLOWDOWN_EXPONENT = 1.65
+TURN_SLOWDOWN_START_PERCENT = 22
+TURN_SLOWDOWN_EXPONENT = 2.10
 RECOVERY_FORWARD_ANGLE_SCALE = 0.82
 RECOVERY_SWITCH_SIDE_AFTER = 4
+SEARCH_FORWARD_ANGLE_SCALE = 1.30
 
 STOPPED = 0
 RUNNING = 1
@@ -130,12 +134,35 @@ def predicted_turn_percent(current_error):
     return 100.0 * clamp01(score)
 
 
-def speed_for_turn_percent(turn_percent):
-    if turn_percent <= TURN_SLOWDOWN_START_PERCENT:
+def line_escape_percent(current_error, steering):
+    if len(error_history) < 3:
+        return 0.0
+
+    abs_now = abs(current_error)
+    abs_prev = abs(error_history[-1])
+    signed_trend = error_history[-1] - error_history[0]
+    motion = clamp01(abs(signed_trend) / 1.1)
+    same_side_ratio = sum(1 for v in error_history if v * current_error > 0) / len(error_history)
+    growth = clamp01((abs_now - abs_prev + 0.12) / 0.45)
+    loaded_steer = clamp01((abs(steering) - 8.0) / 24.0)
+    failure = growth * loaded_steer * same_side_ratio
+
+    score = (
+        0.50 * motion
+        + 0.30 * same_side_ratio
+        + 0.20 * failure
+    )
+    return 100.0 * clamp01(score)
+
+
+def speed_for_turn_percent(turn_percent, escape_percent):
+    effective_percent = max(turn_percent, 0.75 * turn_percent + 0.55 * escape_percent)
+
+    if effective_percent <= TURN_SLOWDOWN_START_PERCENT:
         return SPEED_STRAIGHT
 
     turn_ratio = clamp01(
-        (turn_percent - TURN_SLOWDOWN_START_PERCENT)
+        (effective_percent - TURN_SLOWDOWN_START_PERCENT)
         / (100.0 - TURN_SLOWDOWN_START_PERCENT)
     )
     speed_span = SPEED_STRAIGHT - SPEED_MIN_PREDICTIVE
@@ -256,6 +283,22 @@ if __name__ == "__main__":
                         set_drive_speed(SPEED_GRACE, 1)
 
                         if time.time() - recovery_timer > GRACE_PERIOD_TIME:
+                            recovery_phase = "SEARCH_FORWARD"
+                            recovery_timer = time.time()
+
+                    elif recovery_phase == "SEARCH_FORWARD":
+                        search_steering = max(
+                            -MAX_STEERING_DELTA,
+                            min(
+                                MAX_STEERING_DELTA,
+                                last_steering * SEARCH_FORWARD_ANGLE_SCALE
+                                + 6 * recovery_direction,
+                            ),
+                        )
+                        apply_steering(CENTER_ANGLE + search_steering)
+                        set_drive_speed(SPEED_SEARCH_FORWARD, 1)
+
+                        if time.time() - recovery_timer > SEARCH_FORWARD_TIME:
                             recovery_phase = "SETTLE_BACKWARD"
                             recovery_timer = time.time()
 
@@ -308,7 +351,9 @@ if __name__ == "__main__":
                     pattern_history.append(pattern)
 
                     d_error = error - prev_error
-                    steering = Kp * error + Kd * d_error
+                    short_trend = error - error_history[-2] if len(error_history) > 1 else 0.0
+                    projected_error = error + 0.85 * short_trend
+                    steering = Kp * projected_error + Kd * d_error + Kf * short_trend
                     apply_steering(CENTER_ANGLE + steering)
                     last_steering = steering
 
@@ -318,7 +363,8 @@ if __name__ == "__main__":
                         last_turn_dir = -1
 
                     turn_percent = predicted_turn_percent(error)
-                    target_speed = speed_for_turn_percent(turn_percent)
+                    escape_percent = line_escape_percent(error, steering)
+                    target_speed = speed_for_turn_percent(turn_percent, escape_percent)
                     set_drive_speed(target_speed, 1)
                     prev_error = error
 
