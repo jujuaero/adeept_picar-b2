@@ -142,10 +142,11 @@ class WorldModel:
     CONF_MAX    = 1.5
     CONF_OK     = 0.80               # seuil potentiel -> confirme
     CONF_MIN    = 0.12               # en dessous : oubli
-    TIMEOUT     = 14.0               # s sans aucune mise a jour -> oubli
-    HIT_TIMEOUT = 12.0               # s : pings bruts gardes pour la vue
-    HIT_MAX     = 240
-    ALPHA       = 0.45               # lissage de position
+    TIMEOUT     = 14.0               # s sans aucune mise a jour devant
+    TRAIL_TIMEOUT = 60.0             # s : objets gardes derriere pour la vue
+    HIT_TIMEOUT = 30.0               # s : pings bruts gardes pour la vue
+    HIT_MAX     = 600
+    ALPHA       = 0.28               # lissage de position
 
     def __init__(self):
         self._lock = Lock()
@@ -173,6 +174,8 @@ class WorldModel:
         with self._lock:
             # 1) information negative : on libere la ligne de visee
             for o in self._objs:
+                if o['y'] <= 0:
+                    continue
                 ob = math.atan2(o['x'], o['y'])
                 if abs(self._angdiff(ob, bearing)) <= self.BEAM_HALF:
                     od = math.hypot(o['x'], o['y'])
@@ -184,6 +187,8 @@ class WorldModel:
                 self._hits = self._hits[-self.HIT_MAX:]
                 best, bd = None, self.GATE_MM
                 for o in self._objs:
+                    if o['y'] <= -80.0:
+                        continue
                     d2 = math.hypot(o['x'] - lat, o['y'] - fwd)
                     if d2 < bd:
                         bd, best = d2, o
@@ -197,7 +202,11 @@ class WorldModel:
                                        'conf': self.CONF_HIT, 'last': now})
             # 3) oubli des objets disparus ou perimes
             self._objs = [o for o in self._objs
-                          if o['conf'] > self.CONF_MIN and now - o['last'] < self.TIMEOUT]
+                          if o['conf'] > self.CONF_MIN
+                          and (
+                              (o['y'] >= 0 and now - o['last'] < self.TIMEOUT)
+                              or (o['y'] < 0 and now - o['last'] < self.TRAIL_TIMEOUT)
+                          )]
             self._hits = [h for h in self._hits
                           if h['y'] > -VIEW_MAX_MM and now - h['last'] < self.HIT_TIMEOUT]
 
@@ -460,6 +469,18 @@ def read_boundary():
     world.update_line(l, m, r)
     return l, m, r
 
+def sleep_with_motion(duration, step=0.03):
+    end = time.time() + duration
+    last = time.time()
+    while not _exit_flag:
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(step, remaining))
+        now = time.time()
+        advance_world_from_motion(now - last)
+        last = now
+
 
 # ================================================================ mouvements de tete
 
@@ -507,7 +528,11 @@ def handle_boundary(l, _m, r):
     cleared = False
     clear_t = 0.0
     t0 = time.time()
+    motion_t = t0
     while time.time() - t0 < T_REVERSE:
+        now = time.time()
+        advance_world_from_motion(now - motion_t)
+        motion_t = now
         l2, m2, r2 = read_boundary()
         if not l2 and not m2 and not r2:
             if not cleared:
@@ -524,7 +549,7 @@ def handle_boundary(l, _m, r):
 
     steer(STEER_RIGHT if turn_dir > 0 else STEER_LEFT)
     drive(SPEED_TURN, 1); _upd('speed', SPEED_TURN)
-    time.sleep(T_TURN * 1.3)
+    sleep_with_motion(T_TURN * 1.3)
     stop(); _upd('speed', 0)
     steer(STEER_CENTER)
     set_us(US_FORWARD)
@@ -533,13 +558,13 @@ def handle_obstacle():
     stop(); _upd('speed', 0)
     steer(STEER_CENTER)
     drive(SPEED_REVERSE, -1); _upd('speed', -SPEED_REVERSE)
-    time.sleep(0.30)
+    sleep_with_motion(0.30)
     stop(); _upd('speed', 0)
     turn_dir = us_scan()
     set_us(US_FORWARD - 20 * turn_dir)
     steer(STEER_RIGHT if turn_dir > 0 else STEER_LEFT)
     drive(SPEED_TURN, 1); _upd('speed', SPEED_TURN)
-    time.sleep(T_TURN * 1.3)
+    sleep_with_motion(T_TURN * 1.3)
     stop(); _upd('speed', 0)
     steer(STEER_CENTER)
     set_us(US_FORWARD)
@@ -757,12 +782,43 @@ class VizPygame:
             r_px = int(d_mm * self.DS)
             pygame.gfxdraw.aacircle(surf, cx, cy, r_px, (*col, alpha))
 
+    def _draw_current_sonar(self, surf, s):
+        cx, cy = self._car_origin(s)
+        raw = s.get('us_angle', US_FORWARD)
+        dist = float(s.get('us_dist', WorldModel.MAP_MAX))
+        ray_dist = _clamp(dist, 0.0, min(self.view_mm, WorldModel.MAP_MAX))
+        rad = _raw_to_rad(raw)
+        fwd = -math.sin(rad) * ray_dist
+        lat = math.cos(rad) * ray_dist
+        bearing = math.atan2(lat, fwd)
+
+        left = self._world_to_px(
+            math.sin(bearing - WorldModel.BEAM_HALF) * ray_dist,
+            math.cos(bearing - WorldModel.BEAM_HALF) * ray_dist,
+            s
+        )
+        right = self._world_to_px(
+            math.sin(bearing + WorldModel.BEAM_HALF) * ray_dist,
+            math.cos(bearing + WorldModel.BEAM_HALF) * ray_dist,
+            s
+        )
+        end = self._world_to_px(lat, fwd, s)
+
+        hit = dist < WorldModel.MAP_MAX
+        col = (220, 50, 47) if dist < OBSTACLE_WARN_DIST else GOOG
+        beam = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
+        pygame.gfxdraw.filled_polygon(beam, [(cx, cy), left, right], (*col, 20 if hit else 12))
+        pygame.gfxdraw.aapolygon(beam, [(cx, cy), left, right], (*col, 42 if hit else 28))
+        pygame.draw.line(beam, (*col, 115 if hit else 75), (cx, cy), end, 2)
+        if hit:
+            pygame.gfxdraw.filled_circle(beam, end[0], end[1], 5, (*col, 150))
+            pygame.gfxdraw.aacircle(beam, end[0], end[1], 7, (*col, 120))
+        surf.blit(beam, (0, 0))
+
     # ---- objets du monde virtuel --------------------------------------
     def _draw_obstacles(self, surf, s=None):
         if s is None:
             s = _snap()
-        tph = pygame.time.get_ticks() / 1000.0
-        cx, cy = self._car_origin(s)
 
         for lat, fwd, age in world.detections_snapshot():
             if fwd < -self.view_mm or fwd > self.view_mm:
@@ -770,9 +826,9 @@ class VizPygame:
             px, py = self._world_to_px(lat, fwd, s)
             if px < self.map_left or px > self.map_right or py < self.map_top or py > self.map_bottom:
                 continue
-            a = int(_clamp(200 * (1.0 - age / max(0.01, world.HIT_TIMEOUT)), 30, 200))
+            a = int(_clamp(150 * (1.0 - age / max(0.01, world.HIT_TIMEOUT)), 22, 150))
             dot = pygame.Surface((14, 14), pygame.SRCALPHA)
-            pygame.gfxdraw.filled_circle(dot, 7, 7, 4, (255, 95, 35, a))
+            pygame.gfxdraw.filled_circle(dot, 7, 7, 3, (255, 95, 35, a))
             surf.blit(dot, (px - 7, py - 7))
 
         for lat, fwd, conf, confirmed in world.snapshot():
@@ -782,32 +838,21 @@ class VizPygame:
             if px < self.map_left or px > self.map_right or py < self.map_top or py > self.map_bottom:
                 continue
 
-            # lien robot -> objet : le robot le "tient" en perception
-            link = (228, 150, 140) if confirmed else (232, 205, 175)
-            pygame.draw.aaline(surf, link, (cx, cy), (px, py))
-
-            # onde de detection (sonar) : anneau qui s'etend en continu
-            seed = ((abs(int(lat)) * 13 + abs(int(fwd)) * 7) % 100) / 100.0
-            ph   = (tph * 1.1 + seed) % 1.0
-            rr   = int(11 + 20 * ph)
-            aa   = int(135 * (1.0 - ph) * (1.0 if confirmed else 0.55))
-            if aa > 5:
-                ring = pygame.Surface((rr * 2 + 4, rr * 2 + 4), pygame.SRCALPHA)
-                rc   = (217, 60, 45) if confirmed else (230, 150, 60)
-                pygame.gfxdraw.aacircle(ring, rr + 2, rr + 2, rr, (*rc, aa))
-                surf.blit(ring, (px - rr - 2, py - rr - 2))
+            behind = fwd < 0
 
             if confirmed:
-                # objet confirme : disque rouge plein + ombre + anneau
+                # objet confirme : disque rouge plein, grise quand il est derriere.
                 sh = pygame.Surface((30, 30), pygame.SRCALPHA)
-                pygame.gfxdraw.filled_circle(sh, 15, 15, 12, (60, 50, 45, 50))
+                pygame.gfxdraw.filled_circle(sh, 15, 15, 12, (60, 50, 45, 36 if behind else 50))
                 surf.blit(sh, (px - 15, py - 13))
-                pygame.gfxdraw.filled_circle(surf, px, py, 9, (217, 60, 45))
-                pygame.gfxdraw.aacircle(surf, px, py, 9, (150, 30, 22))
-                pygame.gfxdraw.aacircle(surf, px, py, 10, (150, 30, 22))
+                fill = (135, 95, 88) if behind else (217, 60, 45)
+                edge = (95, 70, 65) if behind else (150, 30, 22)
+                pygame.gfxdraw.filled_circle(surf, px, py, 9, fill)
+                pygame.gfxdraw.aacircle(surf, px, py, 9, edge)
+                pygame.gfxdraw.aacircle(surf, px, py, 10, edge)
             else:
                 # objet potentiel : cercle orange translucide, intensite ~ conf
-                a  = int(80 + 120 * min(conf, 1.0))
+                a  = int((55 if behind else 80) + 95 * min(conf, 1.0))
                 ds = pygame.Surface((30, 30), pygame.SRCALPHA)
                 pygame.gfxdraw.filled_circle(ds, 15, 15, 8, (235, 150, 60, a // 2))
                 pygame.gfxdraw.aacircle(ds, 15, 15, 8, (220, 130, 40, a))
@@ -827,17 +872,6 @@ class VizPygame:
             alpha = int(_clamp(210 * (1.0 - age / max(0.01, IR_LINE_TIMEOUT)), 45, 210))
             pts.append((px, py, alpha, fwd))
 
-        pts.sort(key=lambda p: p[3])
-        for i in range(1, len(pts)):
-            x0, y0, a0, _f0 = pts[i - 1]
-            x1, y1, a1, _f1 = pts[i]
-            if abs(y1 - y0) < 36 and abs(x1 - x0) < 70:
-                col = (12, 12, 12, min(a0, a1))
-                seg = pygame.Surface((abs(x1 - x0) + 10, abs(y1 - y0) + 10), pygame.SRCALPHA)
-                ox, oy = min(x0, x1) - 5, min(y0, y1) - 5
-                pygame.draw.line(seg, col, (x0 - ox, y0 - oy), (x1 - ox, y1 - oy), 5)
-                surf.blit(seg, (ox, oy))
-
         for px, py, alpha, _fwd in pts:
             dot = pygame.Surface((12, 12), pygame.SRCALPHA)
             pygame.gfxdraw.filled_circle(dot, 6, 6, 4, (10, 10, 10, alpha))
@@ -848,18 +882,8 @@ class VizPygame:
         if s is None:
             s = _snap()
         cx, cy = self._car_origin(s)
-        steer_ratio = _clamp(
-            (s.get('steer', STEER_CENTER) - STEER_CENTER) / float(STEER_AMOUNT),
-            -1.0, 1.0
-        )
-        yaw = steer_ratio * 0.34
-        c, sn = math.cos(yaw), math.sin(yaw)
-
         def pt(dx, dy):
-            return (
-                int(cx + dx * c - dy * sn),
-                int(cy + dx * sn + dy * c),
-            )
+            return int(cx + dx), int(cy + dy)
 
         hits = [(flag, dx) for flag, dx in ((l, -20), (m, 0), (r, 20)) if flag]
         if hits:
@@ -878,19 +902,9 @@ class VizPygame:
         if s is None:
             s = _snap()
         cx, cy = self._car_origin(s)
-        steer_ratio = _clamp(
-            (s.get('steer', STEER_CENTER) - STEER_CENTER) / float(STEER_AMOUNT),
-            -1.0, 1.0
-        )
-        yaw = steer_ratio * 0.34
 
         def rot(px, py):
-            dx, dy = px - cx, py - cy
-            c, sn = math.cos(yaw), math.sin(yaw)
-            return (
-                int(cx + dx * c - dy * sn),
-                int(cy + dx * sn + dy * c),
-            )
+            return int(px), int(py)
 
         # fleche/chevron pointant vers l'avant (haut)
         pts = [
@@ -997,8 +1011,9 @@ class VizPygame:
 
             self.screen.blit(self.bg, (0, 0))
             self._draw_detection_range(self.screen, s)
-            self._draw_obstacles(self.screen, s)
             self._draw_ir_history(self.screen, s)
+            self._draw_obstacles(self.screen, s)
+            self._draw_current_sonar(self.screen, s)
             self._draw_car(self.screen, l, m, r, s)
             self._draw_ir_line(self.screen, l, m, r, s)
             self._draw_hud(self.screen, s)
