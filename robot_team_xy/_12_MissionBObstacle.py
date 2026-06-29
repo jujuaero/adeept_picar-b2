@@ -38,40 +38,21 @@ US_RIGHT   = 58
 US_LEFT    = 142
 US_SETTLE  = 0.12
 
-HEAD_AMPLITUDE = 18
-HEAD_PERIOD    = 3.0
-
 STEER_CENTER = CENTER_ANGLE
 STEER_AMOUNT = 38
 STEER_LEFT   = STEER_CENTER - STEER_AMOUNT
 STEER_RIGHT  = STEER_CENTER + STEER_AMOUNT
 
-SPEED_CRUISE  = 35
-SPEED_REVERSE = 38
-SPEED_TURN    = 30
-
-OBSTACLE_DIST = 420
-OBSTACLE_WARN_DIST = 900
 VIEW_MAX_MM = 2000
 VIEW_MIN_ZOOM = 0.50
 VIEW_MAX_ZOOM = 4.00
 
-ROBOT_WIDTH_MM  = 100.0
 ROBOT_LENGTH_MM = 250.0
-ROBOT_HALF_WIDTH_MM = ROBOT_WIDTH_MM / 2.0
 IR_SENSOR_FWD_MM = 90.0
 IR_SENSOR_X_MM   = (-45.0, 0.0, 45.0)
 IR_LINE_TIMEOUT  = 45.0
 IR_LINE_MAX      = 700
 
-OBSTACLE_RADIUS_MM     = 60.0
-AVOID_CLEARANCE_MM     = 80.0
-AVOID_PATH_HALF_MM     = ROBOT_HALF_WIDTH_MM + OBSTACLE_RADIUS_MM + AVOID_CLEARANCE_MM
-AVOID_LOOKAHEAD_MM     = 900.0
-AVOID_SIDE_TARGET_MM   = AVOID_PATH_HALF_MM + 130.0
-AVOID_CRITICAL_Y_MM    = 260.0
-AVOID_MIN_CONF         = 0.30
-SPEED_AVOID_MIN        = 22
 SPEED_PROFILE_MM_S     = (
     (30.0, 210.0),                  # mesures 1s avec accel/freinage inclus
     (40.0, 290.0),
@@ -79,17 +60,16 @@ SPEED_PROFILE_MM_S     = (
 )
 SPEED_MM_PER_SEC_AT_35 = 250.0      # interpolation de la table ci-dessus
 STEER_MAX_WHEEL_DEG    = 26.0
-STEER_SLEW_STEP        = 6.0
-
-T_REVERSE = 0.55
-T_TURN    = 0.50
 
 STOPPED = 0
 RUNNING = 1
+STARTING = 2
 _exit_flag = False
+_hardware_ready = False
 
 # ================================================================ etat partage
 _lock = Lock()
+_drive_lock = Lock()
 _state = {
     'mode':     'ARRET',
     'l': 0, 'm': 0, 'r': 0,
@@ -104,7 +84,6 @@ _state = {
 }
 
 robot_state = STOPPED
-head_t0     = 0.0
 
 
 def _upd(key, val):
@@ -122,6 +101,11 @@ def _raw_to_rad(raw):
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
+def _running():
+    """Vrai tant que la mission tourne. Les manoeuvres bloquantes doivent le
+    surveiller pour pouvoir s'interrompre net quand on appuie sur 'A'."""
+    return robot_state == RUNNING and not _exit_flag
+
 class WorldModel:
     """Carte d'objets persistante, centree sur le robot.
 
@@ -133,7 +117,7 @@ class WorldModel:
     Repere robot : x = lateral (+ = droite), y = avant (+ = devant), en mm.
     Un objet peu confiant est "potentiel", tres confiant il est "confirme".
     """
-    GATE_MM     = 170.0              # rayon d'association ping <-> objet
+    ASSOC_MM    = 170.0              # rayon d'association ping <-> objet
     BEAM_HALF   = math.radians(12)   # demi-ouverture du faisceau US
     MAP_MAX     = 2000.0             # mm : portee max capteur / carte
     FREE_MARGIN = 90.0               # mm de marge avant de liberer
@@ -185,7 +169,7 @@ class WorldModel:
             if hit:
                 self._hits.append({'x': lat, 'y': fwd, 'last': now})
                 self._hits = self._hits[-self.HIT_MAX:]
-                best, bd = None, self.GATE_MM
+                best, bd = None, self.ASSOC_MM
                 for o in self._objs:
                     if o['y'] <= -80.0:
                         continue
@@ -342,125 +326,145 @@ def _advance_visual_lateral(ds_mm, steer_angle, s=None):
     lateral = _clamp(lateral, -360.0, 360.0)
     _upd('sim_lateral', lateral)
 
-def _avoid_candidates():
-    return [
-        (x, y, conf, ok)
-        for x, y, conf, ok in world.snapshot()
-        if -ROBOT_LENGTH_MM * 0.45 < y < AVOID_LOOKAHEAD_MM
-        and (ok or conf >= AVOID_MIN_CONF)
-    ]
+# ================================================================ controle reactif
 
-def _side_risk(objs, side_dir):
-    target_x = side_dir * AVOID_SIDE_TARGET_MM
-    risk = 0.0
-    for x, y, conf, ok in objs:
-        if y <= 0:
-            continue
-        lateral_clearance = abs(x - target_x)
-        overlap = max(0.0, AVOID_PATH_HALF_MM - lateral_clearance)
-        forward_weight = 1.0 + (AVOID_LOOKAHEAD_MM - y) / AVOID_LOOKAHEAD_MM
-        confidence_weight = 1.0 if ok else 0.65
-        risk += overlap * forward_weight * confidence_weight
-    return risk
+# Parametres reglables de la mission. Valeurs volontairement prudentes :
+# la ligne noire est prioritaire, donc la croisiere reste lente.
+CONTROL_DT = 0.018              # s : periode max entre deux lectures ligne en marche avant
+SONAR_MIN_MM = 45               # mm : en dessous, mesure HC-SR04 aberrante
+SONAR_NO_ECHO_MM = 1950         # mm : 2000 ~= pas d'echo, traite a part
+SONAR_STICKY_T = 0.45           # s : garde un obstacle recent malgre un no-echo isole
+SONAR_SAMPLES_FRONT = 3         # mediane de N mesures en face
+SONAR_SAMPLES_SIDE = 2          # mediane courte pendant les scans gauche/droite
 
-def plan_avoidance():
-    """Retourne une consigne d'evitement, ou None si le couloir est libre.
+SPEED_CRUISE = 25              # % : baisser si la ligne est encore franchie
+SPEED_AVOID = 22               # % : vitesse des arcs d'evitement en marche avant
+SPEED_REVERSE = 34             # % : recul franc pour sortir de la frontiere
 
-    Le couloir reserve tient compte du robot (100 mm de large) plus une marge.
-    x positif = droite, donc dir positif = eviter par la droite.
+OBSTACLE_TRIGGER_MM = 560      # mm : declenche l'evitement
+OBSTACLE_CRITICAL_MM = 300     # mm : trop pres -> recul avant contournement
+OBSTACLE_CLEAR_MM = 760        # mm : distance frontale jugee degagee apres braquage
+
+BOUNDARY_REVERSE_T = 0.95      # s : recul en virage quand la ligne est vue
+OBSTACLE_BACKUP_T = 0.32       # s : petit recul si obstacle trop proche
+AVOID_ARC_T = 1.25             # s : arc principal, decide une fois puis execute
+AVOID_PASS_T = 0.60            # s : garde le braquage pour passer l'obstacle
+AVOID_REALIGN_T = 0.55         # s : contre-braque pour se remettre droit
+AVOID_CLEAR_T = 0.45           # s : avance droit avant de commencer le recentrage
+AVOID_DEFAULT_DIR = -1         # cote choisi si gauche/droite sont vraiment identiques
+
+RECENTER_SPEED = 20            # % : recentrage volontairement plus calme
+RECENTER_T = 1.05              # s : compensation laterale apres evitement
+RECENTER_STEER_SCALE = 0.70    # 0..1 : braquage pour revenir vers le centre
+RECENTER_ABORT_MM = 700        # mm : abandon du recentrage si obstacle devant
+
+MOVE_DONE = 'done'
+MOVE_STOPPED = 'stopped'
+MOVE_LINE = 'line'
+MOVE_OBSTACLE = 'obstacle'
+
+
+class SonarFilter:
+    """Filtre minimal pour un HC-SR04 bruyant.
+
+    Les valeurs proches de 2000 mm ne sont pas prises comme preuve immediate
+    que la voie est libre. En face, on garde pendant SONAR_STICKY_T la derniere
+    vraie mesure valide afin qu'un no-echo isole ne supprime pas un obstacle.
     """
-    objs = _avoid_candidates()
-    blockers = [
-        (x, y, conf, ok)
-        for x, y, conf, ok in objs
-        if 0.0 < y < AVOID_LOOKAHEAD_MM and abs(x) < AVOID_PATH_HALF_MM
-    ]
-    if not blockers:
-        _upd('avoid_dir', 0)
-        return None
+    def __init__(self):
+        self.last_valid = VIEW_MAX_MM
+        self.last_valid_t = 0.0
 
-    closest = min(blockers, key=lambda o: o[1])
-    left_risk = _side_risk(objs, -1)
-    right_risk = _side_risk(objs, 1)
-    if abs(left_risk - right_risk) < 1.0:
-        side_dir = -1 if closest[0] >= 0 else 1
-    else:
-        side_dir = -1 if left_risk < right_risk else 1
+    @staticmethod
+    def valid(d):
+        return SONAR_MIN_MM <= d < SONAR_NO_ECHO_MM
 
-    urgency = _clamp(
-        (AVOID_LOOKAHEAD_MM - closest[1]) /
-        max(1.0, AVOID_LOOKAHEAD_MM - AVOID_CRITICAL_Y_MM),
-        0.0, 1.0
-    )
-    steer_mag = 12.0 + urgency * (STEER_AMOUNT - 12.0)
-    speed = int(round(SPEED_CRUISE - urgency * (SPEED_CRUISE - SPEED_AVOID_MIN)))
-    command = {
-        'dir': side_dir,
-        'steer': STEER_CENTER + side_dir * steer_mag,
-        'speed': max(SPEED_AVOID_MIN, speed),
-        'closest_y': closest[1],
-        'closest_x': closest[0],
-    }
-    _upd('avoid_dir', side_dir)
-    return command
+    def read(self, samples=SONAR_SAMPLES_FRONT, sticky=True, delay=0.012, watch_line=False):
+        vals = []
+        for _ in range(samples):
+            if not _running():
+                return VIEW_MAX_MM
+            if watch_line and line_seen():
+                safe_stop_outputs(center=False)
+                return None
+
+            d = checkdist()
+            if watch_line and line_seen():
+                safe_stop_outputs(center=False)
+                return None
+
+            d = VIEW_MAX_MM if d is None else float(d)
+            d = _clamp(d, 0.0, VIEW_MAX_MM)
+            _upd('us_dist', d)
+            _record_obstacle(d)
+            if self.valid(d):
+                vals.append(d)
+            if delay > 0:
+                if not interruptible_sleep(delay, step=0.004, watch_line=watch_line):
+                    return None if watch_line else VIEW_MAX_MM
+
+        now = time.time()
+        if vals:
+            vals.sort()
+            filtered = vals[len(vals) // 2]
+            self.last_valid = filtered
+            self.last_valid_t = now
+        elif sticky and now - self.last_valid_t <= SONAR_STICKY_T:
+            filtered = self.last_valid
+        else:
+            filtered = VIEW_MAX_MM
+
+        _upd('us_dist', filtered)
+        return filtered
+
+    def reset(self):
+        self.last_valid = VIEW_MAX_MM
+        self.last_valid_t = 0.0
 
 
-# ================================================================ helpers servo/moteur
+sonar_filter = SonarFilter()
+
+
+# ================================================================ helpers materiel
 
 def set_us(raw):
     set_angle(US_CH, raw)
     _upd('us_angle', raw)
-
-def measure():
-    d = checkdist()
-    _upd('us_dist', d)
-    _record_obstacle(d)
-    return d
 
 def steer(angle):
     angle = _clamp(angle, STEER_LEFT, STEER_RIGHT)
     set_angle(STEER_CH, to_servo_angle(angle))
     _upd('steer', angle)
 
-def steer_limited(target, step=STEER_SLEW_STEP):
-    target = _clamp(target, STEER_LEFT, STEER_RIGHT)
-    current = _snap().get('steer', STEER_CENTER)
-    delta = _clamp(target - current, -step, step)
-    steer(current + delta)
-    _upd('target_steer', target)
+def _motor_stop_unlocked():
+    if _hardware_ready:
+        stop()
+    _upd('speed', 0)
 
-def drive_avoidance(avoid):
-    steer_limited(avoid['steer'])
-    set_us(US_FORWARD - 16 * avoid['dir'])
-    drive(avoid['speed'], 1)
-    _upd('speed', avoid['speed'])
+def safe_stop_outputs(center=True):
+    with _drive_lock:
+        _motor_stop_unlocked()
+        if center:
+            steer(STEER_CENTER)
+            _upd('target_steer', STEER_CENTER)
 
-def direct_ping_avoidance(dist):
-    if dist >= OBSTACLE_WARN_DIST:
-        return None
-    s = _snap()
-    raw = s.get('us_angle', US_FORWARD)
-    rad = _raw_to_rad(raw)
-    fwd = -math.sin(rad) * dist
-    lat = math.cos(rad) * dist
-    if fwd <= 0 or abs(lat) > AVOID_PATH_HALF_MM:
-        return None
-    side_dir = -1 if lat >= 0 else 1
-    urgency = _clamp(
-        (OBSTACLE_WARN_DIST - dist) /
-        max(1.0, OBSTACLE_WARN_DIST - AVOID_CRITICAL_Y_MM),
-        0.0, 1.0
-    )
-    steer_mag = 16.0 + urgency * (STEER_AMOUNT - 16.0)
-    speed = int(round(SPEED_CRUISE - urgency * (SPEED_CRUISE - SPEED_AVOID_MIN)))
-    _upd('avoid_dir', side_dir)
-    return {
-        'dir': side_dir,
-        'steer': STEER_CENTER + side_dir * steer_mag,
-        'speed': max(SPEED_AVOID_MIN, speed),
-        'closest_y': fwd,
-        'closest_x': lat,
-    }
+def safe_drive(speed_percent, direction, steer_angle):
+    """Commande moteur atomique vis-a-vis de stop_zone().
+
+    Si A vient de passer le robot en STOPPED, cette fonction refuse de relancer
+    les moteurs. stop_zone() utilise le meme verrou et gagne donc proprement.
+    """
+    with _drive_lock:
+        if not _running():
+            _motor_stop_unlocked()
+            return False
+        steer(steer_angle)
+        if direction == 0 or speed_percent <= 0:
+            _motor_stop_unlocked()
+        else:
+            drive(speed_percent, direction)
+            _upd('speed', speed_percent if direction > 0 else -speed_percent)
+    return True
 
 def read_boundary():
     l, m, r = left_s.value, middle_s.value, right_s.value
@@ -469,183 +473,328 @@ def read_boundary():
     world.update_line(l, m, r)
     return l, m, r
 
-def sleep_with_motion(duration, step=0.03):
+def line_seen(flags=None):
+    if flags is None:
+        flags = read_boundary()
+    return bool(flags[0] or flags[1] or flags[2])
+
+def interruptible_sleep(duration, step=CONTROL_DT, watch_line=False):
     end = time.time() + duration
     last = time.time()
-    while not _exit_flag:
+    while _running():
         remaining = end - time.time()
         if remaining <= 0:
-            break
+            return True
+        if watch_line and line_seen():
+            safe_stop_outputs(center=False)
+            return False
         time.sleep(min(step, remaining))
         now = time.time()
         advance_world_from_motion(now - last)
         last = now
+        if watch_line and line_seen():
+            safe_stop_outputs(center=False)
+            return False
+    safe_stop_outputs(center=False)
+    return False
 
 
 # ================================================================ mouvements de tete
 
 def initial_scan():
-    step, delay = 4, 0.035
+    step, delay = 8, 0.025
     for a in range(US_FORWARD, US_RIGHT - 1, -step):
-        set_us(a); time.sleep(delay)
-    time.sleep(0.20)
+        if _exit_flag:
+            break
+        set_us(a)
+        time.sleep(delay)
     for a in range(US_RIGHT, US_LEFT + 1, step):
-        set_us(a); time.sleep(delay)
-    time.sleep(0.20)
+        if _exit_flag:
+            break
+        set_us(a)
+        time.sleep(delay)
     for a in range(US_LEFT, US_FORWARD - 1, -step):
-        set_us(a); time.sleep(delay)
+        if _exit_flag:
+            break
+        set_us(a)
+        time.sleep(delay)
     set_us(US_FORWARD)
 
-def head_idle():
-    elapsed = time.time() - head_t0
-    pos = US_FORWARD + int(HEAD_AMPLITUDE * math.sin(2 * math.pi * elapsed / HEAD_PERIOD))
-    set_us(pos)
+def scan_side(raw_angle):
+    set_us(raw_angle)
+    if not interruptible_sleep(US_SETTLE, step=CONTROL_DT):
+        return VIEW_MAX_MM
+    return sonar_filter.read(samples=SONAR_SAMPLES_SIDE, sticky=False)
 
-def us_scan():
-    set_us(US_RIGHT);  time.sleep(US_SETTLE); d_right = measure()
-    set_us(US_LEFT);   time.sleep(US_SETTLE); d_left  = measure()
+def choose_clear_side():
+    """Retourne +1 pour droite, -1 pour gauche.
+
+    Decision prise une seule fois au debut de l'evitement. On ne choisit pas
+    "au tour par tour" : le cote le plus loin au sonar gagne, puis la manoeuvre
+    est executee jusqu'au bout.
+    """
+    safe_stop_outputs(center=True)
+    d_right = scan_side(US_RIGHT)
+    d_left = scan_side(US_LEFT)
     set_us(US_FORWARD)
-    return 1 if d_right >= d_left else -1
+    if not _running():
+        return AVOID_DEFAULT_DIR
+
+    if d_right > d_left:
+        turn_dir = 1
+    elif d_left > d_right:
+        turn_dir = -1
+    else:
+        turn_dir = AVOID_DEFAULT_DIR
+
+    _upd('avoid_dir', turn_dir)
+    return turn_dir
+
+
+# ================================================================ primitives de mouvement
+
+def guarded_motion(duration, speed, direction, steer_angle,
+                   stop_at_end=True, stop_on_obstacle_mm=None):
+    """Execute un mouvement court et interruptible.
+
+    En marche avant, la ligne est lue avant de commander les moteurs puis a
+    chaque CONTROL_DT. Au premier capteur noir : stop immediat et retour
+    MOVE_LINE. En marche arriere on ne peut pas franchir la ligne frontale :
+    le mouvement reste surtout surveille pour l'arret clavier.
+    """
+    if not _running():
+        safe_stop_outputs(center=False)
+        return MOVE_STOPPED
+
+    if direction > 0 and line_seen():
+        safe_stop_outputs(center=False)
+        return MOVE_LINE
+
+    if not safe_drive(speed, direction, steer_angle):
+        return MOVE_STOPPED
+
+    end = time.time() + duration
+    last = time.time()
+    next_sonar = last
+    while _running():
+        now = time.time()
+        if now >= end:
+            break
+
+        if direction > 0 and line_seen():
+            safe_stop_outputs(center=False)
+            return MOVE_LINE
+
+        if direction > 0 and stop_on_obstacle_mm is not None and now >= next_sonar:
+            set_us(US_FORWARD)
+            d_front = sonar_filter.read(
+                samples=SONAR_SAMPLES_SIDE,
+                sticky=False,
+                watch_line=(direction > 0)
+            )
+            if d_front is None:
+                return MOVE_LINE
+            if stop_on_obstacle_mm is not None and d_front < stop_on_obstacle_mm:
+                safe_stop_outputs(center=False)
+                return MOVE_OBSTACLE
+            next_sonar = now + 0.09
+
+        time.sleep(min(CONTROL_DT, end - now))
+        now2 = time.time()
+        advance_world_from_motion(now2 - last)
+        last = now2
+
+    if not _running():
+        safe_stop_outputs(center=False)
+        return MOVE_STOPPED
+
+    if stop_at_end:
+        safe_stop_outputs(center=False)
+    return MOVE_DONE
 
 
 # ================================================================ manoeuvres
 
-def handle_boundary(l, _m, r):
-    stop(); _upd('speed', 0)
-    time.sleep(0.05)
-
+def boundary_turn_dir(l, _m, r):
     if l and not r:
-        turn_dir = 1
-    elif r and not l:
-        turn_dir = -1
-    else:
-        turn_dir = us_scan()
+        return 1       # ligne a gauche -> nez vers la droite en reculant
+    if r and not l:
+        return -1      # ligne a droite -> nez vers la gauche en reculant
+    avoid_dir = _snap().get('avoid_dir', 0)
+    return avoid_dir if avoid_dir else AVOID_DEFAULT_DIR
 
-    set_us(US_FORWARD - 20 * turn_dir)
-    steer(STEER_LEFT if turn_dir > 0 else STEER_RIGHT)
-    drive(SPEED_REVERSE, -1); _upd('speed', -SPEED_REVERSE)
-
-    cleared = False
-    clear_t = 0.0
-    t0 = time.time()
-    motion_t = t0
-    while time.time() - t0 < T_REVERSE:
-        now = time.time()
-        advance_world_from_motion(now - motion_t)
-        motion_t = now
-        l2, m2, r2 = read_boundary()
-        if not l2 and not m2 and not r2:
-            if not cleared:
-                cleared = True
-                clear_t = time.time()
-            elif time.time() - clear_t > 0.15:
-                break
-        else:
-            cleared = False
-        time.sleep(0.02)
-
-    stop(); _upd('speed', 0)
-    time.sleep(0.06)
-
-    steer(STEER_RIGHT if turn_dir > 0 else STEER_LEFT)
-    drive(SPEED_TURN, 1); _upd('speed', SPEED_TURN)
-    sleep_with_motion(T_TURN * 1.3)
-    stop(); _upd('speed', 0)
-    steer(STEER_CENTER)
+def handle_boundary(l, m, r):
+    """Priorite absolue : aucune avance, uniquement recul en braquant."""
+    _upd('mode', 'FRONTIERE')
+    safe_stop_outputs(center=False)
+    turn_dir = boundary_turn_dir(l, m, r)
+    _upd('avoid_dir', turn_dir)
     set_us(US_FORWARD)
 
-def handle_obstacle():
-    stop(); _upd('speed', 0)
-    steer(STEER_CENTER)
-    drive(SPEED_REVERSE, -1); _upd('speed', -SPEED_REVERSE)
-    sleep_with_motion(0.30)
-    stop(); _upd('speed', 0)
-    turn_dir = us_scan()
-    set_us(US_FORWARD - 20 * turn_dir)
-    steer(STEER_RIGHT if turn_dir > 0 else STEER_LEFT)
-    drive(SPEED_TURN, 1); _upd('speed', SPEED_TURN)
-    sleep_with_motion(T_TURN * 1.3)
-    stop(); _upd('speed', 0)
-    steer(STEER_CENTER)
+    # En marche arriere, le capteur de ligne avant s'eloigne physiquement de la
+    # frontiere. Le braquage sert seulement a accumuler une rotation Ackermann.
+    reverse_steer = STEER_LEFT if turn_dir > 0 else STEER_RIGHT
+    guarded_motion(BOUNDARY_REVERSE_T, SPEED_REVERSE, -1, reverse_steer)
+    safe_stop_outputs(center=True)
     set_us(US_FORWARD)
 
+def handle_recenter(turn_dir):
+    """Compense le decalage lateral cree par l'evitement.
 
-# ================================================================ controle robot
+    Si l'evitement est parti a droite, on revient un peu a gauche, et inversement.
+    Le recentrage reste prudent : ligne noire surveillee et sonar devant actif.
+    """
+    _upd('mode', 'RECENTRAGE')
+    recenter_steer = STEER_CENTER - turn_dir * STEER_AMOUNT * RECENTER_STEER_SCALE
+    res = guarded_motion(
+        RECENTER_T, RECENTER_SPEED, 1, recenter_steer,
+        stop_at_end=True,
+        stop_on_obstacle_mm=RECENTER_ABORT_MM
+    )
+    if res == MOVE_LINE:
+        l, m, r = read_boundary()
+        handle_boundary(l, m, r)
+    safe_stop_outputs(center=True)
+    set_us(US_FORWARD)
+
+def handle_obstacle(initial_dist):
+    """Evitement reactif sans carte ni odometrie."""
+    _upd('mode', 'OBSTACLE' if initial_dist < OBSTACLE_CRITICAL_MM else 'EVITEMENT')
+    safe_stop_outputs(center=True)
+    turn_dir = choose_clear_side()
+    if not _running():
+        return
+
+    if initial_dist < OBSTACLE_CRITICAL_MM:
+        reverse_steer = STEER_LEFT if turn_dir > 0 else STEER_RIGHT
+        res = guarded_motion(OBSTACLE_BACKUP_T, SPEED_REVERSE, -1, reverse_steer)
+        if res == MOVE_STOPPED:
+            return
+
+    arc_steer = STEER_RIGHT if turn_dir > 0 else STEER_LEFT
+    counter_steer = STEER_LEFT if turn_dir > 0 else STEER_RIGHT
+
+    res = guarded_motion(AVOID_ARC_T, SPEED_AVOID, 1, arc_steer, stop_at_end=False)
+    if res == MOVE_LINE:
+        l, m, r = read_boundary()
+        handle_boundary(l, m, r)
+        return
+    if res == MOVE_STOPPED:
+        return
+
+    res = guarded_motion(AVOID_PASS_T, SPEED_AVOID, 1, arc_steer, stop_at_end=False)
+    if res == MOVE_LINE:
+        l, m, r = read_boundary()
+        handle_boundary(l, m, r)
+        return
+    if res == MOVE_STOPPED:
+        return
+
+    res = guarded_motion(AVOID_REALIGN_T, SPEED_AVOID, 1, counter_steer, stop_at_end=True)
+    if res == MOVE_LINE:
+        l, m, r = read_boundary()
+        handle_boundary(l, m, r)
+        return
+    if res == MOVE_STOPPED:
+        return
+
+    res = guarded_motion(
+        AVOID_CLEAR_T, SPEED_AVOID, 1, STEER_CENTER,
+        stop_at_end=False,
+        stop_on_obstacle_mm=RECENTER_ABORT_MM
+    )
+    if res == MOVE_LINE:
+        l, m, r = read_boundary()
+        handle_boundary(l, m, r)
+        return
+    if res in (MOVE_STOPPED, MOVE_OBSTACLE):
+        return
+
+    handle_recenter(turn_dir)
+
+    safe_stop_outputs(center=True)
+    set_us(US_FORWARD)
+    _upd('avoid_dir', 0)
+
+
+# ================================================================ boucle robot
 
 def start_zone():
-    global robot_state, head_t0
+    global robot_state, _hardware_ready
+    with _drive_lock:
+        if robot_state != STOPPED:
+            return
+        robot_state = STARTING
+
     setup()
-    steer(STEER_CENTER)
-    _upd('target_steer', STEER_CENTER)
+    _hardware_ready = True
+    safe_stop_outputs(center=True)
+    set_us(US_FORWARD)
     _clear_obstacles()
+    sonar_filter.reset()
     _upd('mode', 'SCAN')
     initial_scan()
-    head_t0 = time.time()
-    robot_state = RUNNING
-    _upd('mode', 'ACTIF')
+    with _drive_lock:
+        if robot_state != STARTING or _exit_flag:
+            _motor_stop_unlocked()
+            robot_state = STOPPED
+            _upd('mode', 'ARRET')
+            return
+        robot_state = RUNNING
+    _upd('mode', 'CROISIERE')
 
 def stop_zone():
     global robot_state
-    stop()
-    steer(STEER_CENTER)
-    set_us(US_FORWARD)
-    robot_state = STOPPED
+    with _drive_lock:
+        robot_state = STOPPED
+        _motor_stop_unlocked()
+        steer(STEER_CENTER)
+        set_us(US_FORWARD)
     _upd('mode', 'ARRET')
-    _upd('speed', 0)
     _upd('target_steer', STEER_CENTER)
     _upd('avoid_dir', 0)
 
 def robot_loop():
-    boundary_hits = 0
     motion_t = time.time()
     while not _exit_flag:
         now = time.time()
         advance_world_from_motion(now - motion_t)
         motion_t = now
 
-        if robot_state == RUNNING:
-            l, m, r = read_boundary()
-            if l or m or r:
-                boundary_hits += 1
-                if boundary_hits >= 2:
-                    boundary_hits = 0
-                    _upd('mode', 'FRONTIERE')
-                    handle_boundary(l, m, r)
-                    _upd('mode', 'ACTIF')
-                continue
-            else:
-                boundary_hits = 0
-            dist = measure()
+        if robot_state != RUNNING:
+            time.sleep(0.03)
+            continue
 
-            avoid = direct_ping_avoidance(dist) or plan_avoidance()
-            if dist < AVOID_CRITICAL_Y_MM or (
-                avoid is not None and
-                avoid['closest_y'] < AVOID_CRITICAL_Y_MM and
-                abs(avoid['closest_x']) < ROBOT_HALF_WIDTH_MM + OBSTACLE_RADIUS_MM
-            ):
-                _upd('mode', 'OBSTACLE')
-                handle_obstacle()
-                _upd('mode', 'ACTIF')
-                continue
-            if avoid is not None or dist < OBSTACLE_DIST:
-                if avoid is None:
-                    seen_angle = _snap().get('us_angle', US_FORWARD)
-                    turn_dir = 1 if seen_angle > US_FORWARD else -1
-                    avoid = {
-                        'dir': turn_dir,
-                        'steer': STEER_CENTER + turn_dir * (STEER_AMOUNT * 0.75),
-                        'speed': SPEED_AVOID_MIN,
-                    }
-                    _upd('avoid_dir', turn_dir)
-                _upd('mode', 'EVITEMENT')
-                drive_avoidance(avoid)
-                continue
-            _upd('avoid_dir', 0)
-            steer_limited(STEER_CENTER, step=STEER_SLEW_STEP * 0.7)
-            drive(SPEED_CRUISE, 1)
-            _upd('speed', SPEED_CRUISE)
-            head_idle()
-        time.sleep(0.03)
+        l, m, r = read_boundary()
+        if l or m or r:
+            handle_boundary(l, m, r)
+            if _running():
+                _upd('mode', 'CROISIERE')
+            continue
+
+        set_us(US_FORWARD)
+        dist = sonar_filter.read(samples=SONAR_SAMPLES_FRONT, sticky=True, watch_line=True)
+        if not _running():
+            continue
+        if dist is None:
+            l, m, r = read_boundary()
+            handle_boundary(l, m, r)
+            if _running():
+                _upd('mode', 'CROISIERE')
+            continue
+
+        if dist < OBSTACLE_TRIGGER_MM:
+            handle_obstacle(dist)
+            if _running():
+                _upd('mode', 'CROISIERE')
+            continue
+
+        _upd('mode', 'CROISIERE')
+        _upd('avoid_dir', 0)
+        res = guarded_motion(CONTROL_DT, SPEED_CRUISE, 1, STEER_CENTER, stop_at_end=False)
+        if res == MOVE_LINE:
+            l, m, r = read_boundary()
+            handle_boundary(l, m, r)
 
 
 # ================================================================ visualisation pygame
@@ -663,7 +812,9 @@ GOOG_DK = (40,  95,  200)
 MODE_COL = {
     'ARRET':     (120, 124, 134),
     'SCAN':      (200, 150,   0),
+    'CROISIERE': (16,  160,  72),
     'ACTIF':     (16,  160,  72),
+    'RECENTRAGE': (40, 150, 170),
     'EVITEMENT': (66,  133, 244),
     'FRONTIERE': (235, 140,   0),
     'OBSTACLE':  (220,  50,  47),
@@ -775,8 +926,8 @@ class VizPygame:
     def _draw_detection_range(self, surf, s):
         cx, cy = self._car_origin(s)
         for d_mm, alpha, col in (
-            (OBSTACLE_DIST, 80, (220, 50, 47)),
-            (OBSTACLE_WARN_DIST, 55, GOOG),
+            (OBSTACLE_TRIGGER_MM, 80, (220, 50, 47)),
+            (OBSTACLE_CLEAR_MM, 55, GOOG),
             (VIEW_MAX_MM, 38, C_DIM),
         ):
             r_px = int(d_mm * self.DS)
@@ -805,7 +956,7 @@ class VizPygame:
         end = self._world_to_px(lat, fwd, s)
 
         hit = dist < WorldModel.MAP_MAX
-        col = (220, 50, 47) if dist < OBSTACLE_WARN_DIST else GOOG
+        col = (220, 50, 47) if dist < OBSTACLE_TRIGGER_MM else GOOG
         beam = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
         pygame.gfxdraw.filled_polygon(beam, [(cx, cy), left, right], (*col, 20 if hit else 12))
         pygame.gfxdraw.aapolygon(beam, [(cx, cy), left, right], (*col, 42 if hit else 28))
@@ -987,7 +1138,7 @@ class VizPygame:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_m and robot_state == STOPPED:
                         Thread(target=start_zone, daemon=True).start()
-                    elif event.key == pygame.K_a and robot_state == RUNNING:
+                    elif event.key == pygame.K_a and robot_state != STOPPED:
                         stop_zone()
                     elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                         self.zoom_by(1.25)
@@ -1035,7 +1186,7 @@ def _run_terminal():
                 cmd = sys.stdin.readline().strip().upper()
                 if cmd == 'M' and robot_state == STOPPED:
                     Thread(target=start_zone, daemon=True).start()
-                elif cmd == 'A' and robot_state == RUNNING:
+                elif cmd == 'A' and robot_state != STOPPED:
                     stop_zone()
             s = _snap()
             print("\r  %-10s  dist=%4dmm  obj=%d  dir=%2d  L=%d M=%d R=%d  v=%3d%%" % (
@@ -1055,12 +1206,7 @@ def _shutdown():
         return
     _shutdown_done = True
     _exit_flag = True
-    if robot_state == RUNNING:
-        stop_zone()
-    else:
-        stop()
-        steer(STEER_CENTER)
-        set_us(US_FORWARD)
+    stop_zone()
     print('Nettoyage final')
 
 
