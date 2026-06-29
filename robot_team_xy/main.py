@@ -15,16 +15,21 @@ if __name__ == "__main__":
     "3. Camera Line Tracking" \
     "4. Labyrinthe" \
     "Crtl-C to Quit")
+    cmd = input("Envirronement: ")
+    pannel = None
     try :
         while True:
-            cmd = check_keyboard()
-            if cmd == "1":
+            if cmd == "1" :
                 print("Starting Line Tracking")
-            elif cmd == "2":
+                cmd = "wait"
+            elif cmd == "2" or pannel == "travaux":
                 print("Starting Obstacle Avoidance")
-            elif cmd == "3":
+                cmd = "wait"
+            elif cmd == "3" or pannel == "???":
                 print("Starting Camera Line Tracking")
-            elif cmd == "4":
+                cmd = "wait"
+            elif cmd == "4" or pannel == "tunnel":
                 print("Starting Labyrinthe")
+                cmd = "wait"
     except KeyboardInterrupt:
         print("Exiting Robot")
