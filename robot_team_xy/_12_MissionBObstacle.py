@@ -6,6 +6,10 @@ import sys
 import select
 import time
 import math
+import os
+import json
+import base64
+import urllib.request
 from threading import Thread, Lock
 
 try:
@@ -47,19 +51,23 @@ VIEW_MAX_MM = 2000
 VIEW_MIN_ZOOM = 0.50
 VIEW_MAX_ZOOM = 4.00
 
-ROBOT_LENGTH_MM = 250.0
+ROBOT_LENGTH_MM = 120.0         # empattement mesure (axe AV <-> axe AR)
 IR_SENSOR_FWD_MM = 90.0
 IR_SENSOR_X_MM   = (-45.0, 0.0, 45.0)
 IR_LINE_TIMEOUT  = 45.0
 IR_LINE_MAX      = 700
 
 SPEED_PROFILE_MM_S     = (
-    (30.0, 210.0),                  # mesures 1s avec accel/freinage inclus
-    (40.0, 290.0),
-    (50.0, 340.0),
+    (30.0, 250.0),                  # v stabilisee (methode 2 durees) 2026-06-29
+    (40.0, 315.0),                  # v stabilisee (l'ancien 370 surestimait)
+    (50.0, 380.0),                  # extrapole (non mesure, jamais atteint en mission)
 )
-SPEED_MM_PER_SEC_AT_35 = 250.0      # interpolation de la table ci-dessus
-STEER_MAX_WHEEL_DEG    = 26.0
+SPEED_MM_PER_SEC_AT_35 = 282.0      # interpolation de la table ci-dessus
+STEER_MAX_WHEEL_DEG    = 20.0       # rayon de virage MESURE (cercle chrono a 30%) :
+                                    # diametre 670mm -> R=335mm -> atan(120/335)=20deg
+                                    # (a 22% le robot tourne plus serre, R~283mm -> 23deg)
+TURN_SCRUB_FULL        = 0.82       # patinage : vitesse d'arc / vitesse droite a plein
+                                    # braquage (cercle 30% = 204 mm/s vs 250 en ligne droite)
 
 STOPPED = 0
 RUNNING = 1
@@ -81,9 +89,34 @@ _state = {
     'avoid_dir': 0,
     'sim_scroll': 0.0,
     'sim_lateral': 0.0,
+    'ai_ok': 0,
+    'ai_gate': None,
+    'ai_width': None,
+    'ai_age': 999.0,
+    'ai_dets': 0,
+    'ai_ms': 0,
 }
 
 robot_state = STOPPED
+
+# anti-collage : cote du dernier contact de bord et nombre de contacts consecutifs
+_boundary_last_dir = 0
+_boundary_streak = 0
+# cap estime (rad) integre depuis la motricite ; sert d'anti demi-tour. + = gauche.
+_heading = 0.0
+# biais interieur residuel garde en croisiere apres un contact de bord :
+# le robot continue a se tirer vers le centre au lieu de re-longer le bord.
+_inward_bias_dir = 0
+_inward_bias_until = 0.0
+# alternance evitement : dernier cote d'evitement et son horodatage (anti-derive :
+# on n'evite jamais 2x de suite du meme cote dans une fenetre de AVOID_ALTERNATE_T).
+_last_avoid_dir = 0
+_last_avoid_time = 0.0
+# derniere direction de trajet (camera) : on choisit ensuite la porte a l'extremite
+# INVERSE (alternance). +1 = droite, -1 = gauche. 0 = pas encore de reference ->
+# le tout premier scan choisit son cote via sonar (_initial_search_side), PAS
+# code en dur, sinon la mission commence toujours par regarder a droite.
+_last_go_dir = 0
 
 
 def _upd(key, val):
@@ -302,15 +335,25 @@ def _steer_to_yaw(ds_mm, steer_angle):
     # Repere world.advance(): dtheta positif = rotation robot vers la gauche.
     return -(ds_mm / ROBOT_LENGTH_MM) * math.tan(wheel)
 
+def _turn_scrub(steer_angle):
+    """Le robot patine en virage : il avance moins le long de l'arc qu'en ligne
+    droite. Renvoie 1.0 tout droit -> TURN_SCRUB_FULL a plein braquage."""
+    delta = _clamp((steer_angle - STEER_CENTER) / float(STEER_AMOUNT), -1.0, 1.0)
+    return 1.0 - (1.0 - TURN_SCRUB_FULL) * abs(delta)
+
 def advance_world_from_motion(dt):
+    global _heading
     s = _snap()
     speed = s.get('speed', 0)
     if speed == 0 or dt <= 0:
         return
-    ds = _speed_to_mm_s(speed) * dt
-    world.advance(ds, _steer_to_yaw(ds, s.get('steer', STEER_CENTER)))
+    steer = s.get('steer', STEER_CENTER)
+    ds = _speed_to_mm_s(speed) * dt * _turn_scrub(steer)
+    dtheta = _steer_to_yaw(ds, steer)
+    _heading += dtheta
+    world.advance(ds, dtheta)
     _upd('sim_scroll', s.get('sim_scroll', 0.0) + abs(ds))
-    _advance_visual_lateral(ds, s.get('steer', STEER_CENTER), s)
+    _advance_visual_lateral(ds, steer, s)
 
 def _advance_visual_lateral(ds_mm, steer_angle, s=None):
     if s is None:
@@ -345,18 +388,92 @@ OBSTACLE_TRIGGER_MM = 560      # mm : declenche l'evitement
 OBSTACLE_CRITICAL_MM = 300     # mm : trop pres -> recul avant contournement
 OBSTACLE_CLEAR_MM = 760        # mm : distance frontale jugee degagee apres braquage
 
-BOUNDARY_REVERSE_T = 0.95      # s : recul en virage quand la ligne est vue
+# Memoire : on ne fonce pas dans un obstacle vu il y a peu mais sorti du faisceau.
+MAP_CORRIDOR_HALF_MM = 110     # mm : demi-largeur du corridor devant (robot + marge)
+MAP_LOOKAHEAD_MM = 0           # mm : 0 = memoire desactivee (ego-motion trop imprecis) ; sonar-live seul
+MAP_MIN_CONF = 0.50            # confiance mini pour agir sur un objet memorise (evite les pings isoles)
+
+# Perception avant par balayage de la tete (modele-independant : on re-mesure).
+# Remplace la lecture unique droit-devant, qui rate les obstacles legerement decales.
+SWEEP_RAWS   = (US_FORWARD + 34, US_FORWARD + 17, US_FORWARD,
+                US_FORWARD - 17, US_FORWARD - 34)   # ~ +/-36 deg autour de l'avant
+SWEEP_SETTLE = 0.06            # s : pose de la tete a chaque angle (monter si mesures bruitees)
+
+BOUNDARY_REVERSE_T = 0.95      # s : recul en virage quand la ligne est vue (arrivee de face)
+BOUNDARY_NUDGE_T = 0.35        # s : arc AVANT doux pour se decoller d'un effleurement
+BOUNDARY_NUDGE_SPEED = 20      # % : vitesse du decollement (on garde la progression)
+BOUNDARY_INWARD_T = 0.55       # s : arc de reprise courbe vers l'interieur (au lieu de tout droit)
+BOUNDARY_INWARD_SPEED = 20     # % : vitesse de la reprise vers le centre
+BOUNDARY_INWARD_SCALE = 0.60   # 0..1 : braquage de base de la reprise vers l'interieur
+BOUNDARY_STREAK_MAX = 3        # contacts consecutifs au-dela desquels le biais interieur sature
+BOUNDARY_BIAS_T = 1.6          # s : duree du braquage interieur residuel garde en croisiere
+BOUNDARY_BIAS_SCALE = 0.32     # 0..1 : intensite du braquage residuel (0 = ancien comportement)
 OBSTACLE_BACKUP_T = 0.32       # s : petit recul si obstacle trop proche
-AVOID_ARC_T = 1.25             # s : arc principal, decide une fois puis execute
-AVOID_PASS_T = 0.60            # s : garde le braquage pour passer l'obstacle
-AVOID_REALIGN_T = 0.55         # s : contre-braque pour se remettre droit
-AVOID_CLEAR_T = 0.45           # s : avance droit avant de commencer le recentrage
+AVOID_STEP_T = 0.22            # s : pas d'arc court entre deux relectures sonar (evitement reactif)
+AVOID_PASS_T = 0.60            # s : avance ~droit pour passer l'obstacle une fois le front degage
+AVOID_MAX_STEPS = 20           # borne dure du contournement (anti-boucle infinie)
+AVOID_EMERG_MM = 160           # mm : quasi-collision -> petit recul (sinon on tourne EN avancant)
+AVOID_REACT_MM = 380           # mm : nouvel obstacle pendant passage/realignement -> on relache
+HEADING_MAX_DEG = 95.0         # anti demi-tour : rotation max autorisee pendant UNE manoeuvre
+HEADING_ALIGN_DEG = 12.0       # deg : tolerance pour se juger realigne sur le cap d'avant-obstacle
 AVOID_DEFAULT_DIR = -1         # cote choisi si gauche/droite sont vraiment identiques
+AVOID_SIDE_MARGIN_MM = 140     # diff sonar mini pour croire qu'un cote est vraiment meilleur
+AVOID_STUCK_FLIPS = 2          # apres N quasi-collisions, on tente l'autre cote
+AVOID_ALTERNATE_T = 6.0        # s : deux evitements rapproches ne se font JAMAIS du meme
+                               # cote -> on force l'alternance (droite-gauche-droite...).
+AVOID_ALTERNATE_MARGIN_MM = 450  # mm : sauf si un cote est BEAUCOUP plus degage que l'autre
+                                 # (mur d'un cote) : la securite prime alors sur l'alternance.
+GATE_SEARCH_MAX_STEPS = 6      # arcs de recherche de porte du cote OPPOSE au dernier evitement
+GATE_SEARCH_STEP_T = 0.25      # s : duree d'un arc de recherche (la camera doit avoir le temps de voir)
+GATE_SEARCH_SPEED = 18         # % : vitesse lente de recherche (sinon la camera ne suit pas)
 
 RECENTER_SPEED = 20            # % : recentrage volontairement plus calme
-RECENTER_T = 1.05              # s : compensation laterale apres evitement
+RECENTER_T = 1.05              # s : fallback si l'estimation laterale est indisponible
 RECENTER_STEER_SCALE = 0.70    # 0..1 : braquage pour revenir vers le centre
 RECENTER_ABORT_MM = 700        # mm : abandon du recentrage si obstacle devant
+RECENTER_DEADBAND_MM = 45.0    # ignore les petites derives estimees (modele open-loop)
+RECENTER_MAX_T = 1.40          # borne dure : ne pas traverser la zone pour "corriger"
+RECENTER_STEP_T = 0.18         # correction par petits arcs interruptibles
+
+# Guidage camera deporte sur laptop GPU. Desactive par defaut :
+#   PICAR_REMOTE_AI_URL=http://IP_DU_LAPTOP:8765/detect python3 _12_MissionBObstacle.py
+REMOTE_AI_URL = os.environ.get('PICAR_REMOTE_AI_URL', '').strip()
+REMOTE_AI_PERIOD = 0.25        # s : frequence d'envoi camera vers le laptop
+REMOTE_AI_TIMEOUT = 1.5        # s : marge large. Le client IA tourne dans SON thread (ne
+                               # bloque jamais robot_loop) ; un timeout trop court jetait des
+                               # reponses 200 valides et forcait une reouverture camera de 2s.
+REMOTE_AI_MAX_AGE = 1.2        # s : au-dela, on ignore le dernier conseil IA
+REMOTE_AI_W = 640
+REMOTE_AI_H = 480
+REMOTE_AI_JPEG_QUALITY = 65
+REMOTE_AI_HFOV_DEG = 54.0
+REMOTE_AI_MIN_WIDTH_DEG = 8.0  # passage trop etroit/peu fiable -> ignore
+REMOTE_AI_STEER_MAX_DEG = 24.0
+REMOTE_AI_STEER_SCALE = 0.62   # 0..1 : intensite max du braquage IA en croisiere
+# Sens du braquage IA. La camera renvoie +deg = passage a DROITE ; le materiel a un
+# offset direction INVERSE (STEER_CENTER + offset positif = roues a GAUCHE, cf.
+# _04_motor / parcours.py). Ce chemin IA n'a PAS la double inversion du sonar : on
+# inverse donc ici (-1) pour aller VERS la porte. Si le robot fuit la porte, mettre +1.
+REMOTE_AI_STEER_SIGN = -1.0
+# Camera prioritaire : quand un passage fiable est vu, on le SUIT sans bouger la tete.
+# Le balayage sonar lateral (qui fait "fouetter" la tete) n'est declenche que si la
+# camera ne voit pas de passage, ou si un obstacle tres proche est nettement HORS de
+# l'axe de la porte (vrai obstacle, pas un montant sur le cote du passage).
+REMOTE_AI_COMMIT_DEG = 10.0   # deg : en dessous, la porte est jugee "dans l'axe"
+REMOTE_AI_CREEP_SPEED = 18    # % : vitesse d'approche rapprochee pour franchir proprement
+
+# --- Parcours porte par porte (camera fixe + tete sonar fixe vers l'avant) ---
+GO_T = 4.0             # s : duree de progression vers une porte choisie
+TURN_BODY_T = 0.5      # s : rotation du corps vers l'AUTRE cote apres une porte
+DOOR_STEP_T = 0.15     # s : pas de reajustement du cap pendant la progression
+SEARCH_STEP_T = 0.4    # s : pas de rotation quand aucune porte n'est vue
+SEARCH_CAM_DIR = 1     # sens de balayage quand on cherche (+1 = droite camera)
+
+# --- Option 3 : fusion camera(angle) + sonar(distance) ---
+US_CAM_SIGN = 1.0      # +1 : angle camera + (droite) -> tete raw vers US_LEFT (droite phys.)
+                       # si le sonar pointe du mauvais cote, mettre -1
+GATE_PASS_EXTRA_MM = 150  # mm : distance a parcourir AU-DELA de la ligne des bouteilles
+                          # pour franchir la porte (borne par GO_T de toute facon)
 
 MOVE_DONE = 'done'
 MOVE_STOPPED = 'stopped'
@@ -502,22 +619,22 @@ def interruptible_sleep(duration, step=CONTROL_DT, watch_line=False):
 # ================================================================ mouvements de tete
 
 def initial_scan():
-    step, delay = 8, 0.025
-    for a in range(US_FORWARD, US_RIGHT - 1, -step):
-        if _exit_flag:
-            break
-        set_us(a)
-        time.sleep(delay)
-    for a in range(US_RIGHT, US_LEFT + 1, step):
-        if _exit_flag:
-            break
-        set_us(a)
-        time.sleep(delay)
-    for a in range(US_LEFT, US_FORWARD - 1, -step):
-        if _exit_flag:
-            break
-        set_us(a)
-        time.sleep(delay)
+    """Un SEUL balayage lent (centre->gauche->droite->centre) pour peupler la carte.
+    Avant : 3 passages rapides (step 8 / delay 0.025 ~ 320 u/s) = tete qui fouette.
+    Ici step 6 / delay 0.05 (~120 u/s) = calme."""
+    step, delay = 6, 0.05
+    passes = (
+        range(US_FORWARD, US_LEFT + 1, step),    # centre -> gauche
+        range(US_LEFT, US_RIGHT - 1, -step),     # gauche -> droite
+        range(US_RIGHT, US_FORWARD + 1, step),   # droite -> centre
+    )
+    for arc in passes:
+        for a in arc:
+            if _exit_flag:
+                set_us(US_FORWARD)
+                return
+            set_us(a)
+            time.sleep(delay)
     set_us(US_FORWARD)
 
 def scan_side(raw_angle):
@@ -526,12 +643,26 @@ def scan_side(raw_angle):
         return VIEW_MAX_MM
     return sonar_filter.read(samples=SONAR_SAMPLES_SIDE, sticky=False)
 
+def _cam_deg_to_us_raw(cam_deg):
+    """Convertit un angle CAMERA (deg, + = droite) en position servo sonar (raw).
+    Materiel : US_LEFT=142 pointe physiquement a DROITE (cf. [[steering-sign-inverted]]),
+    donc un angle camera positif -> raw > US_FORWARD (regler US_CAM_SIGN si inverse)."""
+    raw = US_FORWARD + US_CAM_SIGN * cam_deg * (42.0 / 45.0)
+    return int(_clamp(raw, US_RIGHT, US_LEFT))
+
+def measure_at_angle(cam_deg):
+    """Pointe la tete sonar vers l'angle CAMERA donne, mesure une fois, puis
+    RECENTRE la tete devant. Renvoie la distance (mm), VIEW_MAX_MM si rien."""
+    d = scan_side(_cam_deg_to_us_raw(cam_deg))
+    set_us(US_FORWARD)
+    return d
+
 def choose_clear_side():
     """Retourne +1 pour droite, -1 pour gauche.
 
-    Decision prise une seule fois au debut de l'evitement. On ne choisit pas
-    "au tour par tour" : le cote le plus loin au sonar gagne, puis la manoeuvre
-    est executee jusqu'au bout.
+    Le sonar a un cone large : une petite difference gauche/droite n'est pas
+    fiable. Dans ce cas on choisit le cote qui rembourse le decalage lateral
+    estime, pour eviter d'empiler tous les contournements du meme cote.
     """
     safe_stop_outputs(center=True)
     d_right = scan_side(US_RIGHT)
@@ -540,15 +671,90 @@ def choose_clear_side():
     if not _running():
         return AVOID_DEFAULT_DIR
 
-    if d_right > d_left:
+    lateral = float(_snap().get('sim_lateral', 0.0))
+    if d_right > d_left + AVOID_SIDE_MARGIN_MM:
         turn_dir = 1
-    elif d_left > d_right:
+    elif d_left > d_right + AVOID_SIDE_MARGIN_MM:
         turn_dir = -1
+    elif abs(lateral) > RECENTER_DEADBAND_MM:
+        turn_dir = -1 if lateral > 0 else 1
     else:
         turn_dir = AVOID_DEFAULT_DIR
 
+    # Alternance : deux evitements rapproches (< AVOID_ALTERNATE_T) ne se font jamais
+    # du meme cote -> droite/gauche/droite... Sauf si un cote est BEAUCOUP plus degage
+    # (mur de l'autre cote) : la securite prime alors sur l'alternance.
+    global _last_avoid_dir, _last_avoid_time
+    now = time.time()
+    strong = abs(d_right - d_left) >= AVOID_ALTERNATE_MARGIN_MM
+    if (not strong and _last_avoid_dir != 0
+            and now - _last_avoid_time < AVOID_ALTERNATE_T
+            and turn_dir == _last_avoid_dir):
+        turn_dir = -_last_avoid_dir
+    _last_avoid_dir = turn_dir
+    _last_avoid_time = now
+
     _upd('avoid_dir', turn_dir)
     return turn_dir
+
+def _initial_search_side():
+    """Cote de depart pour la toute PREMIERE recherche de porte d'une mission
+    (avant qu'un trajet ou un echec de scan ne donne un cote de reference).
+    Base sur une vraie mesure sonar gauche/droite au lieu d'etre code en dur
+    a droite (sinon chaque mission commencait systematiquement en regardant
+    a droite, peu importe l'environnement)."""
+    d_right = scan_side(US_RIGHT)
+    d_left = scan_side(US_LEFT)
+    set_us(US_FORWARD)
+    return 1 if d_right >= d_left else -1
+
+def _map_corridor_dist():
+    """Distance frontale du plus proche obstacle MEMORISE dans le corridor devant
+    le robot, meme s'il est sorti du faisceau sonar. VIEW_MAX_MM si rien.
+
+    Repere carte : x = lateral (+ = droite), y = avant. Sert a completer le sonar
+    live pour ne pas foncer dans un objet vu il y a peu mais hors champ maintenant.
+    """
+    best = float(VIEW_MAX_MM)
+    for x, y, conf, confirmed in world.snapshot():
+        if y <= 0 or y > MAP_LOOKAHEAD_MM:
+            continue
+        if abs(x) > MAP_CORRIDOR_HALF_MM:
+            continue
+        if not confirmed and conf < MAP_MIN_CONF:
+            continue
+        if y < best:
+            best = y
+    return best
+
+def _sweep_front_sector():
+    """Balaye la tete sur le secteur avant (SWEEP_RAWS) PENDANT que le robot roule
+    (coast) et renvoie (dmin, best_dir). Modele-independant : on re-mesure la
+    realite au lieu de faire confiance a la carte.
+
+    dmin      : distance mini valide du secteur (VIEW_MAX_MM si rien).
+    best_dir  : +1 si le plus degage est a droite, -1 a gauche, 0 pile devant.
+    Retourne None si la ligne est vue (l'appelant traite la frontiere) ou a l'arret.
+    """
+    dmin = float(VIEW_MAX_MM)
+    best_d, best_raw = -1.0, US_FORWARD
+    for raw in SWEEP_RAWS:
+        if not _running():
+            return None
+        set_us(raw)
+        if not interruptible_sleep(SWEEP_SETTLE, step=0.01, watch_line=True):
+            return None                      # ligne vue (ou arret)
+        d = checkdist()
+        d = VIEW_MAX_MM if d is None else _clamp(float(d), 0.0, VIEW_MAX_MM)
+        _upd('us_dist', d)
+        _record_obstacle(d)                  # alimente la carte (pour la vue)
+        if SonarFilter.valid(d) and d < dmin:
+            dmin = d
+        if d > best_d:
+            best_d, best_raw = d, raw
+    set_us(US_FORWARD)
+    best_dir = 1 if best_raw < US_FORWARD else (-1 if best_raw > US_FORWARD else 0)
+    return dmin, best_dir
 
 
 # ================================================================ primitives de mouvement
@@ -594,7 +800,10 @@ def guarded_motion(duration, speed, direction, steer_angle,
             )
             if d_front is None:
                 return MOVE_LINE
-            if stop_on_obstacle_mm is not None and d_front < stop_on_obstacle_mm:
+            # sonar live complete par la memoire : un obstacle hors faisceau mais
+            # encore dans le corridor doit aussi stopper le mouvement.
+            d_eff = min(d_front, _map_corridor_dist())
+            if stop_on_obstacle_mm is not None and d_eff < stop_on_obstacle_mm:
                 safe_stop_outputs(center=False)
                 return MOVE_OBSTACLE
             next_sonar = now + 0.09
@@ -623,93 +832,304 @@ def boundary_turn_dir(l, _m, r):
     avoid_dir = _snap().get('avoid_dir', 0)
     return avoid_dir if avoid_dir else AVOID_DEFAULT_DIR
 
-def handle_boundary(l, m, r):
-    """Priorite absolue : aucune avance, uniquement recul en braquant."""
-    _upd('mode', 'FRONTIERE')
-    safe_stop_outputs(center=False)
-    turn_dir = boundary_turn_dir(l, m, r)
-    _upd('avoid_dir', turn_dir)
-    set_us(US_FORWARD)
+def _boundary_kind(l, m, r):
+    """Classe le contact de bord.
 
-    # En marche arriere, le capteur de ligne avant s'eloigne physiquement de la
-    # frontiere. Le braquage sert seulement a accumuler une rotation Ackermann.
-    reverse_steer = STEER_LEFT if turn_dir > 0 else STEER_RIGHT
-    guarded_motion(BOUNDARY_REVERSE_T, SPEED_REVERSE, -1, reverse_steer)
-    safe_stop_outputs(center=True)
-    set_us(US_FORWARD)
-
-def handle_recenter(turn_dir):
-    """Compense le decalage lateral cree par l'evitement.
-
-    Si l'evitement est parti a droite, on revient un peu a gauche, et inversement.
-    Le recentrage reste prudent : ligne noire surveillee et sonar devant actif.
+    - frontal : le capteur milieu touche, ou les deux exterieurs a la fois ->
+      on arrive quasiment de face, impossible d'avancer, il faut reculer.
+    - effleurement : un seul capteur exterieur touche -> le robot rase le bord,
+      on peut le decoller en avancant en arc vers l'interieur.
     """
+    frontal = bool(m) or (l and r)
+    graze = (bool(l) or bool(r)) and not frontal
+    return frontal, graze
+
+def _boundary_reverse(turn_dir):
+    """Recul en arc pour degager le nez du bord (arrivee de face ou echec du
+    decollement). En marche arriere le braquage accumule une rotation Ackermann
+    qui reoriente le robot vers turn_dir."""
+    reverse_steer = STEER_LEFT if turn_dir > 0 else STEER_RIGHT
+    return guarded_motion(BOUNDARY_REVERSE_T, SPEED_REVERSE, -1, reverse_steer)
+
+def _boundary_nudge(turn_dir):
+    """Effleurement : petit arc AVANT qui ecarte le nez du bord sans reculer.
+
+    On surveille uniquement le capteur milieu : s'il touche, c'est qu'on fonce
+    vraiment dans le bord -> retour MOVE_LINE pour que l'appelant bascule sur le
+    recul. Des que les exterieurs se liberent, on s'est decolle : retour DONE.
+    """
+    if not _running():
+        safe_stop_outputs(center=False)
+        return MOVE_STOPPED
+    nudge_steer = STEER_RIGHT if turn_dir > 0 else STEER_LEFT
+    if not safe_drive(BOUNDARY_NUDGE_SPEED, 1, nudge_steer):
+        return MOVE_STOPPED
+
+    end = time.time() + BOUNDARY_NUDGE_T
+    last = time.time()
+    while _running():
+        now = time.time()
+        if now >= end:
+            break
+        l, m, r = read_boundary()
+        if m:
+            safe_stop_outputs(center=False)
+            return MOVE_LINE
+        if not (l or r):
+            break                       # decolle du bord
+        time.sleep(min(CONTROL_DT, end - now))
+        now2 = time.time()
+        advance_world_from_motion(now2 - last)
+        last = now2
+
+    if not _running():
+        safe_stop_outputs(center=False)
+        return MOVE_STOPPED
+    safe_stop_outputs(center=False)
+    return MOVE_DONE
+
+def _boundary_inward_arc(turn_dir):
+    """Reprise apres correction : au lieu de repartir tout droit (qui finit
+    toujours par redriver vers un bord dans une zone courbe), on roule un court
+    arc courbe vers l'interieur. Le biais est renforce si on rase le meme bord
+    plusieurs fois de suite (_boundary_streak)."""
+    if not _running():
+        return
     _upd('mode', 'RECENTRAGE')
-    recenter_steer = STEER_CENTER - turn_dir * STEER_AMOUNT * RECENTER_STEER_SCALE
+    extra = (_boundary_streak - 1) / float(max(1, BOUNDARY_STREAK_MAX - 1))
+    scale = _clamp(BOUNDARY_INWARD_SCALE + 0.30 * extra, 0.0, 1.0)
+    dur = BOUNDARY_INWARD_T * (1.0 + 0.40 * extra)
+    inward_steer = STEER_CENTER + turn_dir * STEER_AMOUNT * scale
     res = guarded_motion(
-        RECENTER_T, RECENTER_SPEED, 1, recenter_steer,
+        dur, BOUNDARY_INWARD_SPEED, 1, inward_steer,
         stop_at_end=True,
         stop_on_obstacle_mm=RECENTER_ABORT_MM
     )
     if res == MOVE_LINE:
-        l, m, r = read_boundary()
-        handle_boundary(l, m, r)
+        # retouche pendant la reprise : recul franc, sans re-enchainer d'arc
+        # (evite toute recursion en cas de robot reellement coince)
+        _boundary_reverse(turn_dir)
+        safe_stop_outputs(center=False)
+
+def handle_boundary(l, m, r):
+    """Bord de zone. La ligne noire n'est jamais franchie.
+
+    - effleurement (un exterieur) -> correction douce en avant (_boundary_nudge)
+    - arrivee de face (milieu, ou deux capteurs) -> recul en arc
+    Dans les deux cas on repart en courbant vers l'interieur, avec un biais
+    renforce si le meme bord est rase plusieurs fois de suite (anti-collage).
+    """
+    global _boundary_last_dir, _boundary_streak
+    _upd('mode', 'FRONTIERE')
+    turn_dir = boundary_turn_dir(l, m, r)
+    _upd('avoid_dir', turn_dir)
+    set_us(US_FORWARD)
+
+    if turn_dir == _boundary_last_dir:
+        _boundary_streak = min(BOUNDARY_STREAK_MAX, _boundary_streak + 1)
+    else:
+        _boundary_streak = 1
+        _boundary_last_dir = turn_dir
+
+    frontal, graze = _boundary_kind(l, m, r)
+    if graze:
+        res = _boundary_nudge(turn_dir)
+        if res == MOVE_STOPPED:
+            return
+        if res == MOVE_LINE:            # l'effleurement a vire au contact franc
+            safe_stop_outputs(center=False)
+            if _boundary_reverse(turn_dir) == MOVE_STOPPED:
+                return
+    else:
+        safe_stop_outputs(center=False)
+        if _boundary_reverse(turn_dir) == MOVE_STOPPED:
+            return
+
+    if not _running():
+        safe_stop_outputs(center=False)
+        return
+
+    _boundary_inward_arc(turn_dir)
+    safe_stop_outputs(center=False)
+    set_us(US_FORWARD)
+
+    # Arme le biais interieur pour la croisiere qui suit : plus le bord est rase
+    # de fois de suite, plus le maintien vers le centre dure longtemps.
+    global _inward_bias_dir, _inward_bias_until
+    _inward_bias_dir = turn_dir
+    _inward_bias_until = time.time() + BOUNDARY_BIAS_T * (
+        1.0 + 0.5 * (_boundary_streak - 1) / float(max(1, BOUNDARY_STREAK_MAX - 1))
+    )
+
+def handle_recenter(turn_dir):
+    """Compense la derive laterale estimee pendant l'evitement.
+
+    L'odometrie est open-loop, donc on ne pretend pas mesurer 10 cm exactement.
+    Mais on garde une "dette" laterale : si les arcs precedents ont pousse le
+    robot vers la droite, on rembourse par des petits arcs vers la gauche jusqu'a
+    revenir pres de l'axe estime. turn_dir reste un fallback si l'estimation est
+    trop faible ou indisponible.
+    """
+    _upd('mode', 'RECENTRAGE')
+    lateral = float(_snap().get('sim_lateral', 0.0))
+    if abs(lateral) < RECENTER_DEADBAND_MM:
+        # Fallback ancien comportement : petit contre-arc apres un evitement
+        # dont l'estimation laterale n'a pas assez bouge.
+        if not turn_dir:
+            safe_stop_outputs(center=True)
+            set_us(US_FORWARD)
+            return
+        recenter_steer = STEER_CENTER - turn_dir * STEER_AMOUNT * RECENTER_STEER_SCALE
+        res = guarded_motion(
+            RECENTER_T, RECENTER_SPEED, 1, recenter_steer,
+            stop_at_end=True,
+            stop_on_obstacle_mm=RECENTER_ABORT_MM
+        )
+        if res == MOVE_LINE:
+            l, m, r = read_boundary()
+            handle_boundary(l, m, r)
+        safe_stop_outputs(center=True)
+        set_us(US_FORWARD)
+        return
+
+    start_t = time.time()
+    while _running():
+        lateral = float(_snap().get('sim_lateral', 0.0))
+        if abs(lateral) <= RECENTER_DEADBAND_MM:
+            break
+        if time.time() - start_t >= RECENTER_MAX_T:
+            break
+
+        correction_dir = -1 if lateral > 0 else 1
+        recenter_steer = STEER_CENTER + correction_dir * STEER_AMOUNT * RECENTER_STEER_SCALE
+        res = guarded_motion(
+            RECENTER_STEP_T, RECENTER_SPEED, 1, recenter_steer,
+            stop_at_end=False,
+            stop_on_obstacle_mm=RECENTER_ABORT_MM
+        )
+        if res == MOVE_LINE:
+            l, m, r = read_boundary()
+            handle_boundary(l, m, r)
+            return
+        if res in (MOVE_STOPPED, MOVE_OBSTACLE):
+            break
+
     safe_stop_outputs(center=True)
     set_us(US_FORWARD)
 
+def _turn_allowed(turn_dir, ref_heading):
+    """Anti demi-tour : refuse de continuer a tourner du meme cote si le robot a
+    deja pivote de plus de HEADING_MAX_DEG DEPUIS le debut de la manoeuvre (ref).
+    Reference locale (et non l'axe de depart) pour rester valable en zone courbe.
+    +heading = gauche ; turn_dir +1 = droite (fait diminuer le cap)."""
+    dh = math.degrees(_heading - ref_heading)
+    if turn_dir > 0 and dh <= -HEADING_MAX_DEG:
+        return False
+    if turn_dir < 0 and dh >= HEADING_MAX_DEG:
+        return False
+    return True
+
+def _realign_to_axis(ref_heading):
+    """Ramene le cap vers celui d'avant l'obstacle, sonar surveille (au lieu d'un
+    contre-braquage chronometre a l'aveugle)."""
+    _upd('mode', 'RECENTRAGE')
+    steps = 0
+    while _running() and steps < AVOID_MAX_STEPS:
+        steps += 1
+        dh = math.degrees(_heading - ref_heading)
+        if abs(dh) <= HEADING_ALIGN_DEG:
+            return MOVE_DONE
+        align_steer = STEER_RIGHT if dh > 0 else STEER_LEFT   # dh>0 (trop a gauche) -> braquer droite
+        res = guarded_motion(AVOID_STEP_T, SPEED_AVOID, 1, align_steer,
+                             stop_at_end=False, stop_on_obstacle_mm=AVOID_REACT_MM)
+        if res != MOVE_DONE:
+            return res
+    return MOVE_DONE
+
 def handle_obstacle(initial_dist):
-    """Evitement reactif sans carte ni odometrie."""
+    """Evitement reactif, sonar lu en continu.
+
+    Phase 1 : tourner vers le cote degage EN AVANCANT (l'Ackermann a besoin de
+    rouler pour braquer) jusqu'a ce que le front soit libre. On ne s'arrete que
+    sur quasi-collision (<AVOID_EMERG_MM) -> petit recul puis on repart.
+    Phase 2 : avancer ~droit pour depasser l'obstacle.
+    Phase 3 : se realigner sur le cap d'avant-obstacle.
+    La rotation est bornee (HEADING_MAX_DEG) pour interdire tout demi-tour ; si le
+    cap sature d'un cote, on bascule de l'autre.
+    """
     _upd('mode', 'OBSTACLE' if initial_dist < OBSTACLE_CRITICAL_MM else 'EVITEMENT')
     safe_stop_outputs(center=True)
+    ref_heading = _heading                       # cap de reference AVANT contournement
     turn_dir = choose_clear_side()
     if not _running():
         return
+    if not _turn_allowed(turn_dir, ref_heading):
+        turn_dir = -turn_dir
 
     if initial_dist < OBSTACLE_CRITICAL_MM:
         reverse_steer = STEER_LEFT if turn_dir > 0 else STEER_RIGHT
-        res = guarded_motion(OBSTACLE_BACKUP_T, SPEED_REVERSE, -1, reverse_steer)
-        if res == MOVE_STOPPED:
+        if guarded_motion(OBSTACLE_BACKUP_T, SPEED_REVERSE, -1, reverse_steer) == MOVE_STOPPED:
             return
 
-    arc_steer = STEER_RIGHT if turn_dir > 0 else STEER_LEFT
-    counter_steer = STEER_LEFT if turn_dir > 0 else STEER_RIGHT
+    # Phase 1 : tourner en avancant jusqu'a degager le front.
+    steps = 0
+    stuck_hits = 0
+    while _running() and steps < AVOID_MAX_STEPS:
+        steps += 1
+        if not _turn_allowed(turn_dir, ref_heading):
+            turn_dir = -turn_dir                 # anti demi-tour : bascule de cote
+            stuck_hits = 0
+        arc_steer = STEER_RIGHT if turn_dir > 0 else STEER_LEFT
+        res = guarded_motion(AVOID_STEP_T, SPEED_AVOID, 1, arc_steer,
+                             stop_at_end=False, stop_on_obstacle_mm=AVOID_EMERG_MM)
+        if res == MOVE_LINE:
+            l, m, r = read_boundary()
+            handle_boundary(l, m, r)
+            return
+        if res == MOVE_STOPPED:
+            return
+        if res == MOVE_OBSTACLE:                 # quasi-collision : petit recul, puis on retourne
+            reverse_steer = STEER_LEFT if turn_dir > 0 else STEER_RIGHT
+            if guarded_motion(OBSTACLE_BACKUP_T, SPEED_REVERSE, -1, reverse_steer) == MOVE_STOPPED:
+                return
+            stuck_hits += 1
+            if stuck_hits >= AVOID_STUCK_FLIPS:
+                turn_dir = -turn_dir
+                stuck_hits = 0
+            continue
+        stuck_hits = 0
+        # MOVE_DONE : rien de proche dans l'axe courant -> le front est-il degage ?
+        set_us(US_FORWARD)
+        d_front = sonar_filter.read(samples=SONAR_SAMPLES_SIDE, sticky=False, watch_line=True)
+        if d_front is None:
+            l, m, r = read_boundary()
+            handle_boundary(l, m, r)
+            return
+        if not _running():
+            return
+        if d_front > OBSTACLE_TRIGGER_MM:
+            break                                # voie devant degagee
 
-    res = guarded_motion(AVOID_ARC_T, SPEED_AVOID, 1, arc_steer, stop_at_end=False)
+    # Phase 2 : avancer ~droit pour depasser l'obstacle qu'on vient de contourner.
+    res = guarded_motion(AVOID_PASS_T, SPEED_AVOID, 1, STEER_CENTER,
+                         stop_at_end=False, stop_on_obstacle_mm=AVOID_REACT_MM)
     if res == MOVE_LINE:
         l, m, r = read_boundary()
         handle_boundary(l, m, r)
         return
     if res == MOVE_STOPPED:
         return
+    # MOVE_OBSTACLE : un nouvel obstacle -> on laisse robot_loop le redetecter.
 
-    res = guarded_motion(AVOID_PASS_T, SPEED_AVOID, 1, arc_steer, stop_at_end=False)
-    if res == MOVE_LINE:
+    # Phase 3 : se remettre dans l'axe d'avant-obstacle.
+    if _realign_to_axis(ref_heading) == MOVE_LINE:
         l, m, r = read_boundary()
         handle_boundary(l, m, r)
         return
-    if res == MOVE_STOPPED:
-        return
 
-    res = guarded_motion(AVOID_REALIGN_T, SPEED_AVOID, 1, counter_steer, stop_at_end=True)
-    if res == MOVE_LINE:
-        l, m, r = read_boundary()
-        handle_boundary(l, m, r)
-        return
-    if res == MOVE_STOPPED:
-        return
-
-    res = guarded_motion(
-        AVOID_CLEAR_T, SPEED_AVOID, 1, STEER_CENTER,
-        stop_at_end=False,
-        stop_on_obstacle_mm=RECENTER_ABORT_MM
-    )
-    if res == MOVE_LINE:
-        l, m, r = read_boundary()
-        handle_boundary(l, m, r)
-        return
-    if res in (MOVE_STOPPED, MOVE_OBSTACLE):
-        return
-
+    # Phase 4 : rembourser le decalage lateral estime. Pour les "portes", c'est
+    # ce qui evite d'enchainer les contournements toujours du meme cote jusqu'au
+    # bord de la zone.
     handle_recenter(turn_dir)
 
     safe_stop_outputs(center=True)
@@ -717,10 +1137,306 @@ def handle_obstacle(initial_dist):
     _upd('avoid_dir', 0)
 
 
+def search_for_gate(prefer_dir):
+    """Recherche active d'une porte du cote 'prefer_dir' (typiquement l'OPPOSE du
+    dernier evitement). On tourne la TETE et les ROUES de ce cote et on avance
+    doucement : la camera etant fixe (solidaire du chassis), c'est en faisant
+    pivoter le chassis qu'on la fait "regarder" ce cote et trouver un autre
+    passage (ex : a evite a droite -> cherche a gauche). Retourne True des qu'une
+    porte fiable apparait.
+
+    Meme convention de signe que choose_clear_side / handle_obstacle (repere
+    "code", double-inverse mais coherent avec le materiel)."""
+    if _remote_ai is None or not _running():
+        return False
+    _upd('mode', 'RECHERCHE')
+    head_raw = US_RIGHT if prefer_dir > 0 else US_LEFT
+    search_steer = STEER_RIGHT if prefer_dir > 0 else STEER_LEFT
+    ref_heading = _heading
+    for _ in range(GATE_SEARCH_MAX_STEPS):
+        if not _running():
+            break
+        if _remote_ai.fresh_gate() is not None:
+            set_us(US_FORWARD)
+            return True
+        # anti demi-tour : on ne pivote pas indefiniment du meme cote
+        if abs(math.degrees(_heading - ref_heading)) >= HEADING_MAX_DEG:
+            break
+        # tete du cote recherche : regarde ou l'on va ET donne le degagement
+        if scan_side(head_raw) < OBSTACLE_CRITICAL_MM:
+            break                       # ce cote est bouche de trop pres
+        set_us(head_raw)
+        # stop_on_obstacle_mm : recentre la tete pour verifier le front pendant
+        # l'arc (avant : aucune protection -> le robot pouvait foncer dedans).
+        res = guarded_motion(GATE_SEARCH_STEP_T, GATE_SEARCH_SPEED, 1, search_steer,
+                             stop_at_end=False, stop_on_obstacle_mm=OBSTACLE_CRITICAL_MM)
+        if res == MOVE_LINE:
+            l, m, r = read_boundary()
+            handle_boundary(l, m, r)
+            set_us(US_FORWARD)
+            return False
+        if res == MOVE_STOPPED:
+            break
+        if res == MOVE_OBSTACLE:
+            d_front = sonar_filter.read(samples=SONAR_SAMPLES_SIDE, sticky=False, watch_line=True)
+            set_us(US_FORWARD)
+            if d_front is not None and _running():
+                handle_obstacle(d_front)
+            return False
+    found = _remote_ai.fresh_gate() is not None
+    set_us(US_FORWARD)
+    return found
+
+
 # ================================================================ boucle robot
 
+def _remote_ai_endpoint(url):
+    url = (url or '').strip()
+    if not url:
+        return ''
+    if url.endswith('/'):
+        url = url[:-1]
+    return url if url.endswith('/detect') else url + '/detect'
+
+
+def _reset_ai_state():
+    with _lock:
+        _state['ai_ok'] = 0
+        _state['ai_gate'] = None
+        _state['ai_width'] = None
+        _state['ai_age'] = 999.0
+        _state['ai_dets'] = 0
+        _state['ai_ms'] = 0
+
+
+class RemoteAIGuide:
+    """Client camera -> laptop GPU.
+
+    La boucle tourne en arriere-plan DES LE LANCEMENT du script (pas besoin
+    d'appuyer sur M) : ca permet de voir le retour camera / les detections
+    tout de suite, meme mission a l'arret. Elle ne commande jamais le robot
+    directement : elle publie seulement le centre du passage detecte, que
+    robot_loop utilise comme braquage doux (et seulement quand RUNNING).
+    """
+    def __init__(self, url):
+        self.url = _remote_ai_endpoint(url)
+        self._lock = Lock()
+        self._stop = False
+        self._started = False
+        self._latest = {
+            'ok': False,
+            'gate': None,
+            'width': None,
+            'last': 0.0,
+            'dets': 0,
+            'ms': 0,
+            'det_ang': [],
+        }
+
+    def start(self):
+        if self._started or not self.url:
+            return
+        self._started = True
+        Thread(target=self._loop, daemon=True).start()
+
+    def stop(self):
+        self._stop = True
+
+    def snapshot(self):
+        with self._lock:
+            s = dict(self._latest)
+        s['age'] = time.time() - s.get('last', 0.0)
+        return s
+
+    def fresh_gate(self):
+        s = self.snapshot()
+        gate = s.get('gate')
+        width = s.get('width')
+        if not s.get('ok') or gate is None or width is None:
+            return None
+        if s['age'] > REMOTE_AI_MAX_AGE or width < REMOTE_AI_MIN_WIDTH_DEG:
+            return None
+        return s
+
+    def rightmost_door(self, min_width_deg):
+        """Angle (deg, + = droite) du centre de la porte la plus a DROITE : le
+        PREMIER intervalle assez large entre deux objets en balayant de droite a
+        gauche. None si rien de fiable / trop vieux / moins de 2 objets."""
+        s = self.snapshot()
+        if s['age'] > REMOTE_AI_MAX_AGE:
+            return None
+        objs = sorted(s.get('det_ang') or [], key=lambda t: t[1])   # gauche -> droite
+        # on part de la paire la plus a DROITE et on descend vers la gauche
+        for i in range(len(objs) - 2, -1, -1):
+            gap = objs[i + 1][0] - objs[i][2]      # bord gauche du droit - bord droit du gauche
+            if gap >= min_width_deg:
+                return 0.5 * (objs[i][2] + objs[i + 1][0])
+        return None
+
+    def rightmost_door_full(self, min_width_deg):
+        """Comme rightmost_door, mais renvoie (centre_deg, bouteille_gauche_deg,
+        bouteille_droite_deg) : les centres des 2 bouteilles qui bordent la porte,
+        pour mesurer leur distance au sonar. None si rien de fiable."""
+        s = self.snapshot()
+        if s['age'] > REMOTE_AI_MAX_AGE:
+            return None
+        objs = sorted(s.get('det_ang') or [], key=lambda t: t[1])   # gauche -> droite
+        for i in range(len(objs) - 2, -1, -1):
+            gap = objs[i + 1][0] - objs[i][2]
+            if gap >= min_width_deg:
+                center = 0.5 * (objs[i][2] + objs[i + 1][0])
+                return (center, objs[i][1], objs[i + 1][1])
+        return None
+
+    def extremity_door(self, min_width_deg, side):
+        """Porte a l'EXTREMITE demandee : side +1 = la plus a DROITE, -1 = la plus a
+        GAUCHE. Renvoie (centre_deg, bouteille_gauche_deg, bouteille_droite_deg) ou
+        None. On calcule tous les intervalles assez larges entre bouteilles
+        adjacentes, puis on garde celui dont le centre est le plus du cote 'side'."""
+        s = self.snapshot()
+        if s['age'] > REMOTE_AI_MAX_AGE:
+            return None
+        objs = sorted(s.get('det_ang') or [], key=lambda t: t[1])   # gauche -> droite
+        best = None
+        for i in range(len(objs) - 1):
+            gap = objs[i + 1][0] - objs[i][2]
+            if gap < min_width_deg:
+                continue
+            center = 0.5 * (objs[i][2] + objs[i + 1][0])
+            if best is None or (center > best[0] if side >= 0 else center < best[0]):
+                best = (center, objs[i][1], objs[i + 1][1])
+        return best
+
+    def _publish(self, ok, gate=None, width=None, dets=0, ms=0, det_ang=None):
+        now = time.time()
+        with self._lock:
+            self._latest = {
+                'ok': bool(ok),
+                'gate': gate,
+                'width': width,
+                'last': now,
+                'dets': int(dets),
+                'ms': int(ms or 0),
+                'det_ang': det_ang or [],
+            }
+        with _lock:
+            _state['ai_ok'] = 1 if ok else 0
+            _state['ai_gate'] = gate
+            _state['ai_width'] = width
+            _state['ai_age'] = 0.0
+            _state['ai_dets'] = int(dets)
+            _state['ai_ms'] = int(ms or 0)
+
+    @staticmethod
+    def _open_camera():
+        import cv2
+        from picamera2 import Picamera2
+
+        cam = Picamera2()
+        cfg = cam.preview_configuration
+        cfg.size = (REMOTE_AI_W, REMOTE_AI_H)
+        cfg.format = "RGB888"
+        cam.configure("preview")
+        cam.start()
+        time.sleep(0.35)
+        return cam, cv2
+
+    @staticmethod
+    def _jpeg_b64(cv2, bgr):
+        ok, enc = cv2.imencode(
+            ".jpg",
+            bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), REMOTE_AI_JPEG_QUALITY]
+        )
+        if not ok:
+            raise RuntimeError("encodage JPEG impossible")
+        return base64.b64encode(enc.tobytes()).decode('ascii')
+
+    def _call_server(self, image_b64):
+        payload = {
+            'image_b64': image_b64,
+            'hfov_deg': REMOTE_AI_HFOV_DEG,
+            'debug': False,
+        }
+        req = urllib.request.Request(
+            self.url,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        with urllib.request.urlopen(req, timeout=REMOTE_AI_TIMEOUT) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+
+    def _loop(self):
+        cam = None
+        cv2 = None
+        next_try = 0.0
+        while not self._stop and not _exit_flag:
+            try:
+                if cam is None:
+                    if time.time() < next_try:
+                        time.sleep(0.15)
+                        continue
+                    cam, cv2 = self._open_camera()
+
+                rgb = cam.capture_array()
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                ans = self._call_server(self._jpeg_b64(cv2, bgr))
+                dets_list = ans.get('detections') or []
+                det_ang = [
+                    (d['angle_left_deg'], d['angle_center_deg'], d['angle_right_deg'])
+                    for d in dets_list
+                    if 'angle_left_deg' in d and 'angle_center_deg' in d
+                    and 'angle_right_deg' in d
+                ]
+                gate = ans.get('gate') or {}
+                ok = bool(ans.get('ok')) and bool(gate.get('ok'))
+                self._publish(
+                    ok,
+                    gate.get('gate_center_deg') if ok else None,
+                    gate.get('gate_width_deg') if ok else None,
+                    len(dets_list),
+                    ans.get('inference_ms', 0),
+                    det_ang,
+                )
+                time.sleep(REMOTE_AI_PERIOD)
+            except Exception as e:
+                self._publish(False)
+                print('Remote AI indisponible:', e)
+                if cam is not None:
+                    try:
+                        cam.stop()
+                        cam.close()
+                    except Exception:
+                        pass
+                cam = None
+                cv2 = None
+                next_try = time.time() + 2.0
+
+        if cam is not None:
+            try:
+                cam.stop()
+                cam.close()
+            except Exception:
+                pass
+
+
+_remote_ai = None
+
+
+def _ensure_remote_ai():
+    global _remote_ai
+    if not REMOTE_AI_URL:
+        return None
+    if _remote_ai is None:
+        _remote_ai = RemoteAIGuide(REMOTE_AI_URL)
+        _remote_ai.start()
+        print('Remote AI active:', _remote_ai.url)
+    return _remote_ai
+
 def start_zone():
-    global robot_state, _hardware_ready
+    global robot_state, _hardware_ready, _boundary_last_dir, _boundary_streak
+    global _inward_bias_dir, _inward_bias_until, _heading, _last_avoid_dir, _last_avoid_time, _last_go_dir
     with _drive_lock:
         if robot_state != STOPPED:
             return
@@ -730,10 +1446,20 @@ def start_zone():
     _hardware_ready = True
     safe_stop_outputs(center=True)
     set_us(US_FORWARD)
+    _boundary_last_dir = 0
+    _boundary_streak = 0
+    _inward_bias_dir = 0
+    _inward_bias_until = 0.0
+    _last_avoid_dir = 0
+    _last_avoid_time = 0.0
+    _last_go_dir = 0
+    _heading = 0.0
     _clear_obstacles()
     sonar_filter.reset()
+    _reset_ai_state()
+    _ensure_remote_ai()
     _upd('mode', 'SCAN')
-    initial_scan()
+    set_us(US_FORWARD)               # tete devant, pas de balayage : la camera percoit
     with _drive_lock:
         if robot_state != STARTING or _exit_flag:
             _motor_stop_unlocked()
@@ -754,7 +1480,98 @@ def stop_zone():
     _upd('target_steer', STEER_CENTER)
     _upd('avoid_dir', 0)
 
+def pick_rightmost_door():
+    """Angle (deg, + = droite) de la porte la plus a DROITE vue par la camera,
+    ou None. (Detail du choix : RemoteAIGuide.rightmost_door.)"""
+    if _remote_ai is None:
+        return None
+    return _remote_ai.rightmost_door(REMOTE_AI_MIN_WIDTH_DEG)
+
+
+def turn_body(cam_dir, dur):
+    """Fait pivoter le CHASSIS vers cam_dir (+1 = droite camera, -1 = gauche) en
+    roulant lentement (Ackermann : il faut avancer pour tourner), TETE FIXE devant.
+    La ligne noire est prioritaire, et un obstacle qui apparait pendant le
+    redressement declenche un evitement au lieu d'etre fonce dedans."""
+    if cam_dir == 0 or not _running():
+        return
+    set_us(US_FORWARD)
+    steer_angle = STEER_CENTER + REMOTE_AI_STEER_SIGN * cam_dir * STEER_AMOUNT
+    res = guarded_motion(dur, GATE_SEARCH_SPEED, 1, steer_angle, stop_at_end=True,
+                         stop_on_obstacle_mm=OBSTACLE_CRITICAL_MM)
+    if res == MOVE_LINE:
+        l, m, r = read_boundary()
+        handle_boundary(l, m, r)
+    elif res == MOVE_OBSTACLE:
+        d_front = sonar_filter.read(samples=SONAR_SAMPLES_SIDE, sticky=False, watch_line=True)
+        if d_front is not None and _running():
+            handle_obstacle(d_front)
+
+
+def drive_to_door(door_deg, go_t=GO_T):
+    """ETAPE AVANCE : roule vers la porte pendant go_t s, cap FIXE sur l'angle
+    trouve au scan (on ne rechoisit PAS de porte en route), TETE FIXE devant.
+    S'arrete net sur ligne, et EVITE si un obstacle apparait en route (au lieu
+    de juste stopper et laisser la boucle rescanner sur place). Renvoie le
+    cote suivi (+1 droite, -1 gauche, 0 tout droit)."""
+    _upd('mode', 'AVANCE')
+    set_us(US_FORWARD)
+    gate_deg = _clamp(door_deg, -REMOTE_AI_STEER_MAX_DEG, REMOTE_AI_STEER_MAX_DEG)
+    followed = 1 if gate_deg > 0 else (-1 if gate_deg < 0 else 0)
+    _upd('avoid_dir', followed)
+    steer_angle = STEER_CENTER + REMOTE_AI_STEER_SIGN * (
+        gate_deg / REMOTE_AI_STEER_MAX_DEG
+    ) * STEER_AMOUNT * REMOTE_AI_STEER_SCALE
+    res = guarded_motion(go_t, SPEED_CRUISE, 1, steer_angle,
+                         stop_at_end=True, stop_on_obstacle_mm=OBSTACLE_CRITICAL_MM)
+    if res == MOVE_LINE:
+        l, m, r = read_boundary()
+        handle_boundary(l, m, r)
+    elif res == MOVE_OBSTACLE:
+        set_us(US_FORWARD)
+        d_front = sonar_filter.read(samples=SONAR_SAMPLES_SIDE, sticky=False, watch_line=True)
+        if d_front is not None and _running():
+            handle_obstacle(d_front)
+    return followed
+
+
+def _wait_fresh_door(side, timeout=1.5):
+    """ETAPE SCAN (a l'arret) : attend jusqu'a timeout s une image camera FRAICHE,
+    puis renvoie la porte a l'extremite 'side' (+1 = la plus a droite, -1 = la plus
+    a gauche) : (centre, bouteille_gauche, bouteille_droite). None si rien vu / ligne.
+    Le robot doit deja etre A L'ARRET quand on appelle (aucun mouvement ici)."""
+    if _remote_ai is None:
+        return None
+    end = time.time() + timeout
+    while _running() and time.time() < end:
+        if line_seen():
+            return None
+        snap = _remote_ai.snapshot()
+        _upd('ai_age', snap.get('age', 999.0))
+        if snap.get('age', 999.0) <= REMOTE_AI_MAX_AGE:
+            info = _remote_ai.extremity_door(REMOTE_AI_MIN_WIDTH_DEG, side)
+            if info is not None:
+                return info
+        time.sleep(0.05)
+    return None
+
+
 def robot_loop():
+    """Boucle decomposee, STOP entre chaque etape :
+      1) STOP net (roues centrees, tete devant)
+      2) securite sonar : un obstacle deja tres proche pile devant passe AVANT
+         toute recherche de porte -> evitement immediat (handle_obstacle)
+      3) SCAN camera (si dispo) a l'arret -> porte a l'extremite OPPOSEE au
+         trajet precedent ; si rien dans le champ fixe, RECHERCHE ACTIVE
+         (search_for_gate fait pivoter la TETE et le CHASSIS de ce cote pour
+         regarder ailleurs) avant de retenter
+      4) si une porte est trouvee : AVANCER vers elle (avec evitement si un
+         obstacle apparait en route) puis TOURNER pour se remettre droit
+      5) sinon (pas d'IA configuree, ou toujours rien apres la recherche) :
+         croisiere reactive au sonar seul (avance tant que c'est degage,
+         evite sinon) -> le robot ne reste jamais bloque a l'arret indefiniment.
+    La ligne noire est toujours prioritaire."""
+    global _last_go_dir
     motion_t = time.time()
     while not _exit_flag:
         now = time.time()
@@ -765,36 +1582,91 @@ def robot_loop():
             time.sleep(0.03)
             continue
 
-        l, m, r = read_boundary()
-        if l or m or r:
+        # --- ETAPE 1 : STOP net ---
+        safe_stop_outputs(center=True)
+        set_us(US_FORWARD)
+
+        # securite : ligne noire prioritaire
+        if line_seen():
+            l, m, r = read_boundary()
             handle_boundary(l, m, r)
-            if _running():
-                _upd('mode', 'CROISIERE')
             continue
 
-        set_us(US_FORWARD)
-        dist = sonar_filter.read(samples=SONAR_SAMPLES_FRONT, sticky=True, watch_line=True)
+        # --- ETAPE 2 : securite sonar avant toute chose (ne jamais foncer dedans) ---
+        d_front = sonar_filter.read(samples=SONAR_SAMPLES_SIDE, sticky=False, watch_line=True)
+        if d_front is None:
+            continue                        # ligne vue pendant la mesure
         if not _running():
             continue
-        if dist is None:
-            l, m, r = read_boundary()
-            handle_boundary(l, m, r)
-            if _running():
-                _upd('mode', 'CROISIERE')
+        if d_front < OBSTACLE_CRITICAL_MM:
+            handle_obstacle(d_front)
             continue
 
-        if dist < OBSTACLE_TRIGGER_MM:
-            handle_obstacle(dist)
-            if _running():
-                _upd('mode', 'CROISIERE')
+        # --- ETAPE 3 : SCAN camera (si dispo) -> porte a l'extremite INVERSE du dernier trajet ---
+        info = None
+        if _remote_ai is not None:
+            _upd('mode', 'SCAN')
+            side = -_last_go_dir if _last_go_dir != 0 else _initial_search_side()
+            info = _wait_fresh_door(side)
+            if info is None and search_for_gate(side):
+                # trouvee pendant la recherche active (tete+chassis ont tourne)
+                info = _remote_ai.extremity_door(REMOTE_AI_MIN_WIDTH_DEG, side)
+            if info is None:
+                # echec des deux cotes ce tour-ci : on alterne le cote scanne au
+                # prochain essai (sinon _last_go_dir ne change qu'apres un passage
+                # de porte REUSSI -> on restait bloque a rescanner le meme cote).
+                _last_go_dir = side
+
+        if info is not None:
+            door, bottle_l, bottle_r = info
+
+            # (option 3, a l'arret) distance sonar des 2 bouteilles -> duree d'avance
+            dL = measure_at_angle(bottle_l)
+            dR = measure_at_angle(bottle_r)
+            cand = [d for d in (dL, dR) if SonarFilter.valid(d)]
+            if cand:
+                _upd('us_dist', min(cand))
+                v = abs(_speed_to_mm_s(SPEED_CRUISE)) or 1.0
+                go_t = _clamp((min(cand) + GATE_PASS_EXTRA_MM) / v, 0.8, GO_T)
+            else:
+                go_t = GO_T                 # rien de fiable au sonar -> avance pleine
+
+            # --- ETAPE 4 : AVANCER vers la porte, puis se REDRESSER et RECENTRER ---
+            ref_heading = _heading      # cap avant la manoeuvre : sert a corriger apres
+            went = drive_to_door(door, go_t)
+            if not _running():
+                continue
+            if went != 0:
+                # redresse le CAP MESURE (pas un pulse aveugle a duree fixe comme
+                # avant) : la courbe vers la porte devie le cap d'une quantite
+                # variable selon go_t/vitesse/angle -> on corrige jusqu'a revenir
+                # pres du cap d'avant-manoeuvre, pour que le prochain scan camera
+                # regarde bien devant (et pas de travers).
+                if _realign_to_axis(ref_heading) == MOVE_LINE:
+                    l, m, r = read_boundary()
+                    handle_boundary(l, m, r)
+                    continue
+            # recentrage lateral estime (sim_lateral) : ramene le robot vers le
+            # milieu du corridor au lieu de deriver indefiniment d'un cote.
+            handle_recenter(went)
+            _last_go_dir = went             # -> prochaine porte a l'extremite inverse
+            _upd('avoid_dir', 0)
             continue
 
+        # --- ETAPE 5 : pas de porte fiable (pas d'IA, ou rien trouve) -> croisiere sonar ---
         _upd('mode', 'CROISIERE')
-        _upd('avoid_dir', 0)
-        res = guarded_motion(CONTROL_DT, SPEED_CRUISE, 1, STEER_CENTER, stop_at_end=False)
-        if res == MOVE_LINE:
-            l, m, r = read_boundary()
-            handle_boundary(l, m, r)
+        if d_front > OBSTACLE_TRIGGER_MM:
+            res = guarded_motion(AVOID_PASS_T, SPEED_CRUISE, 1, STEER_CENTER,
+                                 stop_at_end=False, stop_on_obstacle_mm=OBSTACLE_TRIGGER_MM)
+            if res == MOVE_LINE:
+                l, m, r = read_boundary()
+                handle_boundary(l, m, r)
+            elif res == MOVE_OBSTACLE:
+                d2 = sonar_filter.read(samples=SONAR_SAMPLES_SIDE, sticky=False, watch_line=True)
+                if d2 is not None and _running():
+                    handle_obstacle(d2)
+        else:
+            handle_obstacle(d_front)
 
 
 # ================================================================ visualisation pygame
@@ -814,6 +1686,8 @@ MODE_COL = {
     'SCAN':      (200, 150,   0),
     'CROISIERE': (16,  160,  72),
     'ACTIF':     (16,  160,  72),
+    'IA_PASSAGE': (145, 80, 190),
+    'RECHERCHE': (120, 90, 200),
     'RECENTRAGE': (40, 150, 170),
     'EVITEMENT': (66,  133, 244),
     'FRONTIERE': (235, 140,   0),
@@ -1206,14 +2080,17 @@ def _shutdown():
         return
     _shutdown_done = True
     _exit_flag = True
+    if _remote_ai is not None:
+        _remote_ai.stop()
     stop_zone()
     print('Nettoyage final')
 
 
 if __name__ == '__main__':
+    _ensure_remote_ai()          # retour camera dispo tout de suite, pas besoin de M
     Thread(target=robot_loop, daemon=True).start()
 
-    use_gui = '--no-gui' not in sys.argv and PYGAME_OK
+    use_gui = '--gui' in sys.argv and PYGAME_OK   # Vision 2D OFF par defaut (--gui pour l'activer)
     if use_gui:
         try:
             viz = VizPygame()

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments (jamais versionnees : torch/cv2/etc = plusieurs Go)
+.venv/
+.venv*/
+venv/
+env/
+ENV/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editeurs
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
