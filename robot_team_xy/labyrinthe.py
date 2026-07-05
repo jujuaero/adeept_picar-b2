@@ -31,34 +31,63 @@ def apply_steering(angle):
     set_angle(channel, to_servo_angle(angle))
 
 def detect_arrow_direction(frame):
-    # 1. Convertir en niveaux de gris
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
-    # 2. Binariser (Le noir devient blanc/actif)
-    _, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
-    
-    # 3. Trouver les contours
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if contours:
-        c = max(contours, key=cv2.contourArea)
-        
-        if cv2.contourArea(c) > 500:
-            x, y, w, h = cv2.boundingRect(c)
-            roi = thresh[y:y+h, x:x+w]
-            
-            left_half = roi[:, :w//2]
-            right_half = roi[:, w//2:]
-            
-            left_pixels = cv2.countNonZero(left_half)
-            right_pixels = cv2.countNonZero(right_half)
-            
-            if left_pixels > right_pixels:
-                return "RIGHT"
-            else:
-                return "LEFT"
-                
-    return "UNKNOWN"
+    threshold = 1000
+
+    # 1. Pretraitement pour isoler la forme blanche
+    if len(frame.shape) == 3:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = frame.copy()
+
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(contour) < threshold:
+        return None
+
+    # 2. Redresser numeriquement la fleche (annule le roulis de la camera)
+    rect = cv2.minAreaRect(contour)
+    (center_x, center_y), (width, height), angle = rect
+
+    if width < height:
+        angle += 90
+
+    rot_matrix = cv2.getRotationMatrix2D((center_x, center_y), angle, 1.0)
+    h_img, w_img = mask.shape[:2]
+    straightened_mask = cv2.warpAffine(mask, rot_matrix, (w_img, h_img), flags=cv2.INTER_LINEAR)
+
+    # 3. Recuperer la nouvelle forme redressee
+    new_contours, _ = cv2.findContours(straightened_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not new_contours:
+        return None
+
+    clean_contour = max(new_contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(clean_contour)
+
+    # Protection contre les artefacts
+    if w == 0 or h == 0 or w < h:
+        return None
+
+    # 4. Test des tranches (15% a chaque extremite)
+    slice_width = max(1, int(w * 0.15))
+    left_slice = straightened_mask[y:y+h, x:x+slice_width]
+    right_slice = straightened_mask[y:y+h, (x+w-slice_width):x+w]
+
+    left_pixels = cv2.countNonZero(left_slice)
+    right_pixels = cv2.countNonZero(right_slice)
+
+    if left_pixels == 0 and right_pixels == 0:
+        return None
+
+    # La pointe a moins de pixels que la queue
+    return "RIGHT" if right_pixels < left_pixels else "LEFT"
 
 def execute_90_degree_turn(direction):
     print(f"-> Virage fluide vers : {direction}")
@@ -136,7 +165,7 @@ if __name__ == '__main__':
             elif current_state == STATE_STOP_LOOK:
                 direction = detect_arrow_direction(frame)
                 
-                if direction != "UNKNOWN":
+                if direction is not None:
                     print(f"-> Fleche detectee : {direction}")
                     current_state = STATE_MANEUVER
                 else:
